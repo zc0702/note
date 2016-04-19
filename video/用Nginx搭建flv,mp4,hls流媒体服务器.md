@@ -45,26 +45,26 @@
 4. 问题解决
 
   4.1 如果在configure过程中出现以下错误：
-  /root/nginx_mod_h264_streaming-2.2.7/src/ngx_http_streaming_module.c: In function ‘ngx_streaming_handler’:
-  /root/nginx_mod_h264_streaming-2.2.7/src/ngx_http_streaming_module.c:158: error: ‘ngx_http_request_t’ has no member named ‘zero_in_uri’
-  make[1]: *** [objs/addon/src/ngx_http_h264_streaming_module.o] Error 1
-  make[1]: Leaving directory `/root/nginx-0.8.54'
-  make: *** [build] Error 2
-  
-  那么将src/ngx_http_streaming_module.c文件中以下代码删除或者是注释掉就可以了：
-  
-  if (r->zero_in_uri)
-  {
-  return NGX_DECLINED;
-  }
+    /root/nginx_mod_h264_streaming-2.2.7/src/ngx_http_streaming_module.c: In function ‘ngx_streaming_handler’:
+    /root/nginx_mod_h264_streaming-2.2.7/src/ngx_http_streaming_module.c:158: error: ‘ngx_http_request_t’ has no member named ‘zero_in_uri’
+    make[1]: *** [objs/addon/src/ngx_http_h264_streaming_module.o] Error 1
+    make[1]: Leaving directory `/root/nginx-0.8.54'
+    make: *** [build] Error 2
+    
+    那么将src/ngx_http_streaming_module.c文件中以下代码删除或者是注释掉就可以了：
+    
+    if (r->zero_in_uri)
+    {
+      return NGX_DECLINED;
+    }
 
-  如果你没有对这个文件做个更改，那么应该在源码的第157-161行。这个问题是由于版本原因引起，在此不再讨论。
-  修改完之后，记得先执行make clean，然后再进行重新执行configure、make，最后make install。
+    如果你没有对这个文件做个更改，那么应该在源码的第157-161行。这个问题是由于版本原因引起，在此不再讨论。
+    修改完之后，记得先执行make clean，然后再进行重新执行configure、make，最后make install。
   4.2 如果在编译过程中出现以下错误：
-  cc1: warnings being treated as errors
-  那么修改/nginx-1.6.0/objs/Makefile文件
-  CFLAGS =  -pipe  -O -W -Wall -Wpointer-arith -Wno-unused-parameter -Werror -g  -D_LARGEFILE_SOURCE -DBUILDING_NGINX -I../nginx-rtmp-module-master
-  把上面的 -Werror去掉，不把warnning当作error处理
+    cc1: warnings being treated as errors
+    那么修改/nginx-1.6.0/objs/Makefile文件
+    CFLAGS =  -pipe  -O -W -Wall -Wpointer-arith -Wno-unused-parameter -Werror -g  -D_LARGEFILE_SOURCE -DBUILDING_NGINX -I../nginx-rtmp-module-master
+    把上面的 -Werror去掉，不把warnning当作error处理
 
 5. Nginx的配置
 
@@ -78,225 +78,121 @@
     worker_connections  1024;
   }
 
-rtmp {
-
+  rtmp {
     server {
-
         listen 1935;
-
         chunk_size 4000;
-
- 
-
         # video on demand for flv files
-
         application vod {
-
             play /usr/local/nginx/html/flv;
-
         }
-
         # video on demand for mp4 files
-
         application vod2 {
-
             play /usr/local/nginx/html/mp4;
-
         }
-
         application hls {
-
             live on;
-
             hls on;
-
             hls_path /tmp/hls;
-
         }
-
         # MPEG-DASH is similar to HLS
-
         application dash {
-
             live on;
-
             dash on;
-
             dash_path /tmp/dash;
-
         }
-
     }
-
-}
-
-http {
-
+  }
+  http {
     include       mime.types;
-
     default_type  application/octet-stream;
-
- 
-
     #log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
-
     #                  '$status $body_bytes_sent "$http_referer" '
-
     #                  '"$http_user_agent" "$http_x_forwarded_for"';
-
- 
-
     #access_log  logs/access.log  main;
-
     sendfile        on;
-
     #tcp_nopush     on;
-
     #keepalive_timeout  0;
-
     keepalive_timeout  65; 
-
     #gzip  on;
-
- 
-
     server {
-
         # in case we have another web server on port 80
-
         listen       8080;
-
         server_name  localhost;
-
         #charset koi8-r;
-
         #access_log  logs/host.access.log  main; 
-
         location / {
-
             root   html;
-
             index  index.html index.htm;
-
         }
-
         #error_page  404              /404.html;
-
         # redirect server error pages to the static page /50x.html
-
         #
-
         error_page   500 502 503 504  /50x.html;
-
         location = /50x.html {
-
             root   html;
-
         }
-
          location ~ \.mp4$ {
-
             mp4;
-
         }
-
         location ~ \.flv$ {
-
-        flv;
-
+            flv;
          }
-
         # This URL provides RTMP statistics in XML
-
         location /stat {
-
             rtmp_stat all;
-
             rtmp_stat_stylesheet stat.xsl;
-
         }
-
         location /stat.xsl {
-
             # XML stylesheet to view RTMP stats.
-
             # Copy stat.xsl wherever you want
-
             # and put the full directory path here
-
             root /var/www/;
-
         }
-
         location /hls {
-
             # Serve HLS fragments
-
             types {
-
                 application/vnd.apple.mpegurl m3u8;
-
                 video/mp2t ts;
-
             }
-
             #where the m3u8 and ts files are
-
             alias /usr/local/nginx/html/hls;           
-
             #live streaming setting           
-
             #root /tmp;
-
             #add_header Cache-Control no-cache;
-
         }
-
         location /dash {
-
             # Serve DASH fragments
-
             root /tmp;
-
             add_header Cache-Control no-cache;
-
         }
-
     }
-
 }
 
 6. 用ffmpeg生成测试序列
 
-【1】对于mp4文件，生成moov信息前移的mp4格式,适合流媒体播放。
+* 对于mp4文件，生成moov信息前移的mp4格式,适合流媒体播放。
+  ffmpeg -i /home/administrator/Videos/Amelia_720p.mp4 -c:v libx264 -c:a libvo_aacenc -f mp4 -movflags faststart /home/administrator/Videos/moovfront.mp4
 
-ffmpeg -i /home/administrator/Videos/Amelia_720p.mp4 -c:v libx264 -c:a libvo_aacenc -f mp4 -movflags faststart /home/administrator/Videos/moovfront.mp4
+* 对于flv文件，用flvmeta工具在metadata中注入关键帧的信息，支持随意拖动播放。
+  ffmpeg -i/home/administrator/Videos/Baroness.mp4 -vcodec libx264 -acodec libvo_aacenc -b:a 128k -ar 44100 -ac 2 -f flv /home/administrator/Videos/Baroness.flv
+  
+  flvmeta -U -m -k /home/administrator/Videos/Baroness.flv /home/administrator/Videos/Baroness_meta.flv
 
-【2】对于flv文件，用flvmeta工具在metadata中注入关键帧的信息，支持随意拖动播放。
-
-ffmpeg -i/home/administrator/Videos/Baroness.mp4 -vcodec libx264 -acodec libvo_aacenc -b:a 128k -ar 44100 -ac 2 -f flv /home/administrator/Videos/Baroness.flv
-
-flvmeta -U -m -k /home/administrator/Videos/Baroness.flv /home/administrator/Videos/Baroness_meta.flv
-
-【3】对于flv的播放，或者直接生成f4v格式的文件。
-
-ffmpeg -i /home/administrator/Videos/sample/vc1_1080p.mkv -acodec libfdk_aac -ac 2 -b:a 128k -ar 48000 -vcodec libx264 -pix_fmt yuv420p -profile:v main -level 32 -b:v 1000K -r 29.97 -g 30 -s 960x540 -f f4v /home/administrator/Videos/hddvd_1000k.f4v
-
- 
+* 对于flv的播放，或者直接生成f4v格式的文件。
+  ffmpeg -i /home/administrator/Videos/sample/vc1_1080p.mkv -acodec libfdk_aac -ac 2 -b:a 128k -ar 48000 -vcodec libx264 -pix_fmt yuv420p -profile:v main -level 32 -b:v 1000K -r 29.97 -g 30 -s 960x540 -f f4v /home/administrator/Videos/hddvd_1000k.f4v
 
 7. Nginx启动，重启，关闭命令
 
-start nginx 开启  
+  start nginx 开启  
 
-nginx -s stop 快速关闭   
+  nginx -s stop 快速关闭   
 
-nginx -s quit 完全关闭   
+  nginx -s quit 完全关闭   
 
-nginx -s reload 修改过配置文件，快速关闭旧的，开启新服务    
+  nginx -s reload 修改过配置文件，快速关闭旧的，开启新服务    
 
-nginx -s reopen 重新打开日志文件  
-
- 
+  nginx -s reopen 重新打开日志文件  
 
 [停止操作]
 
