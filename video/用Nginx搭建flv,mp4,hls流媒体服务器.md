@@ -278,14 +278,14 @@
     ./ffmpeg -loglevel verbose -re -i /home/administrator/Videos/sample/h264_720p_hp_5.1_6mbps_ac3_unstyled_subs_planet.mkv  -vcodec libx264 -vprofile baseline -acodec libmp3lame -ar 44100 -ac 2 -f flv rtmp://localhost:1935/hls/movie
 
 参考资料：
-http://blog.csdn.net/cjsafty/article/details/9108587
-http://www.codesky.net/article/201105/118326.html
-http://blog.csdn.net/kl222/article/details/12968815
-http://www.leaseweblabs.com/2013/11/streaming-video-demand-nginx-rtmp-module/
-http://razvantudorica.com/12/hls-video-on-demand-streaming
-http://www.razvantudorica.com/12/how-to-play-hls-with-jwplayer/
-https://github.com/arut/nginx-rtmp-module
-https://github.com/mangui/HLSprovider
-http://nginx.org/en/docs/http/ngx_http_hls_module.html
-https://flowplayer.org/pricing/#downloads
-http://flash.flowplayer.org/plugins/streaming/rtmp.html
+http://blog.csdn.net/cjsafty/article/details/9108587<br/>
+http://www.codesky.net/article/201105/118326.html<br/>
+http://blog.csdn.net/kl222/article/details/12968815<br/>
+http://www.leaseweblabs.com/2013/11/streaming-video-demand-nginx-rtmp-module/<br/>
+http://razvantudorica.com/12/hls-video-on-demand-streaming<br/>
+http://www.razvantudorica.com/12/how-to-play-hls-with-jwplayer/<br/>
+https://github.com/arut/nginx-rtmp-module<br/>
+https://github.com/mangui/HLSprovider<br/>
+http://nginx.org/en/docs/http/ngx_http_hls_module.html<br/>
+https://flowplayer.org/pricing/#downloads<br/>
+http://flash.flowplayer.org/plugins/streaming/rtmp.html<br/>
