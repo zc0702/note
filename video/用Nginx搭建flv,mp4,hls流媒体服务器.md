@@ -44,7 +44,7 @@
 
 4. 问题解决
 
-  1. 如果在configure过程中出现以下错误：
+  4.1 如果在configure过程中出现以下错误：
   /root/nginx_mod_h264_streaming-2.2.7/src/ngx_http_streaming_module.c: In function ‘ngx_streaming_handler’:
   /root/nginx_mod_h264_streaming-2.2.7/src/ngx_http_streaming_module.c:158: error: ‘ngx_http_request_t’ has no member named ‘zero_in_uri’
   make[1]: *** [objs/addon/src/ngx_http_h264_streaming_module.o] Error 1
@@ -58,9 +58,9 @@
   return NGX_DECLINED;
   }
 
-如果你没有对这个文件做个更改，那么应该在源码的第157-161行。这个问题是由于版本原因引起，在此不再讨论。
-修改完之后，记得先执行make clean，然后再进行重新执行configure、make，最后make install。
-  2. 如果在编译过程中出现以下错误：
+  如果你没有对这个文件做个更改，那么应该在源码的第157-161行。这个问题是由于版本原因引起，在此不再讨论。
+  修改完之后，记得先执行make clean，然后再进行重新执行configure、make，最后make install。
+  4.2 如果在编译过程中出现以下错误：
   cc1: warnings being treated as errors
   那么修改/nginx-1.6.0/objs/Makefile文件
   CFLAGS =  -pipe  -O -W -Wall -Wpointer-arith -Wno-unused-parameter -Werror -g  -D_LARGEFILE_SOURCE -DBUILDING_NGINX -I../nginx-rtmp-module-master
