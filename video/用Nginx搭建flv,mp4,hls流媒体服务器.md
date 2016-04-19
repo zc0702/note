@@ -2,10 +2,12 @@
 
 > 转自：http://blog.sina.com.cn/s/blog_15b2d69500102wc5r.html
 
+`
   模块:nginx_mod_h264_streaming（支持h264编码MP4格式的视频）
   模块:http_flv_module （支持flv）
   模块:http_mp4_module （支持mp4）
   模块:nginx-rtmp-module （支持rtmp协议，也支持HLS）
+`
 
 1. 模块下载和解压
 
