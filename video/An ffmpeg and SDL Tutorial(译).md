@@ -376,3 +376,318 @@ SDL_GetError() 是为了方便调试bug。
 你可能需要做一些不同的事情来编译它在您的系统上,请检查SDL系统文档。一旦编译,然后运行它。
 
 目前为止视频可以播放，但是它播放非常非常快，实际上我们没有对显示的帧的速度进行控制，目前我们先不控制，第五章的时候我们会做处理。接下来我们要处理很重要的东西：声音！
+
+###第三章：播放音频
+
+> Code: [tutorial03.c](http://dranger.com/ffmpeg/tutorial03.c)
+
+####Audio
+
+现在我们想播放声音。SDL也提供了播放声音的方法。SDL_OpenAudio() 函数是用来打开音频设备的。它需要一个 SDL_AudioSpec 结构体的参数，其中包含所有我们将要输出的音频信息。
+
+在讲解如何设置它之前，我们先解释一下电脑是如何处理音频的，数字音频是由一长串连续的采样构成的。每一个样本代表音频波形中的一个值。音频被记录在某一个特定的采样率，简单的说就是每秒播放的样本数。举个例子，采样率是 22050 和 44100，分别是无线电和CD的采样率。另外，大多数音频有多个声道用来播放环绕立体声，举个例子，如果在立体声中采样，样本在同一时间将会是两个。当我们从视频文件中获取数据的时候，我们并不知道会得到多少样本，但是ffmpeg不会只给我们部分样本，这也意味着它不会分离一个立体声样本。
+
+SDL播放音频的方法：
+设置音频选项：采样率（SDL的结构中被称作"freq"），声道的数量等等，通常我们还会设置一个回调函数和用户数据。当我们开始播放音频，SDL将会不断的调用这个回调函数，让它往音频缓冲区填充一定数量字节的数据。在我们给 SDL_AudioSpec 放完这些数据后，我们调用 SDL_OpenAudio() 函数，它将打开音频设备，并给我们返回另一个 AudioSpec 结构体。这些规格会被我们使用 —— 我们无法保证得到我们所要的。
+
+####设置音频
+
+让这些保留在你大脑里一会儿，因为我们没有真正的获取任何有关于音频流的数据。现在我们回到我们获取视频流的代码中，在这找到我们需要的音频流。
+
+    // Find the first video stream
+    videoStream=-1;
+    audioStream=-1;
+    for(i=0; i < pFormatCtx->nb_streams; i++) {
+      if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO && videoStream < 0) {
+        videoStream=i;
+      }
+      if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_AUDIO && audioStream < 0) {
+        audioStream=i;
+      }
+    }
+    if(videoStream==-1)
+      return -1; // Didn't find a video stream
+    if(audioStream==-1)
+      return -1;
+
+从流中的AVCodecContext可以得到我们想要的所有信息，就像从视频流中获取一样:
+
+    AVCodecContext *aCodecCtxOrig;
+    AVCodecContext *aCodecCtx;
+    
+    aCodecCtxOrig = pFormatCtx->streams[audioStream]->codec;
+
+如果你还记得之前的教程，我们仍然需要打开音频的 codec。这很简单:
+
+    AVCodec         *aCodec;
+    
+    aCodec = avcodec_find_decoder(aCodecCtx->codec_id);
+    if(!aCodec) {
+      fprintf(stderr, "Unsupported codec!\n");
+      return -1;
+    }
+    // Copy context
+    aCodecCtx = avcodec_alloc_context3(aCodec);
+    if(avcodec_copy_context(aCodecCtx, aCodecCtxOrig) != 0) {
+      fprintf(stderr, "Couldn't copy codec context");
+      return -1; // Error copying codec context
+    }
+    /* set up SDL Audio here */
+    
+    avcodec_open2(aCodecCtx, aCodec, NULL);
+
+编解码器上下文中包含所有信息，我们需要设置我们的音频:
+
+    wanted_spec.freq = aCodecCtx->sample_rate;
+    wanted_spec.format = AUDIO_S16SYS;
+    wanted_spec.channels = aCodecCtx->channels;
+    wanted_spec.silence = 0;
+    wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE;
+    wanted_spec.callback = audio_callback;
+    wanted_spec.userdata = aCodecCtx;
+    
+    if(SDL_OpenAudio(&wanted_spec, &spec) < 0) {
+      fprintf(stderr, "SDL_OpenAudio: %s\n", SDL_GetError());
+      return -1;
+    }
+
+参数解释:
+ - freq: 采样率。
+ - format: 传给SDL的格式。"S16SYS" 中 "S" 代表签名(signed)，"16"代表每一个样本长度为16位(bits)，"SYS"表示endian-order将取决于你的系统。这是 avcodec_decode_audio2 将给我们的音频格式。
+ - channels: 声道个数。
+ - silence: 消除噪音。通常这个值为0。
+ - samples: 音频缓冲区大小。一般在 512 到 8192 之间，ffplay 使用的是 1024。
+ - callback: 回调函数。稍后我们会讨论更多关于回调函数的话题。
+ - userdata: SDL调用回调函数时，会给我们一个指向用户数据的空指针（void pointer），我们希望它知道我们的 codec context。 
+
+最后我们用 SDL_OpenAudio 打开音频。
+
+####队列
+
+现在我们准备好从流中获取音频数据流了。但我们能对这些数据做什么呢？我们将从视频文件中获取连续的packets，但是同时SDL会调用回调函数。解决方案是创建一种我们能通过audio_callback填充音频包的全局的结构体。所以我们要创建一个packets的队列。ffmpeg 提供了一个结构来帮我们处理这个：AVPacketList，就是packet的linked list，在这就是我们的队列结构：
+
+    typedef struct PacketQueue {
+      AVPacketList *first_pkt, *last_pkt;
+      int nb_packets;
+      int size;
+      SDL_mutex *mutex;
+      SDL_cond *cond;
+    } PacketQueue;
+
+我们要知道 nb_packets 与 packet->size 的大小是不一样的。在这我们有一个互斥锁和一个状态变量。这是因为SDL的音频处理是一个单独运行的线程。如果我们不锁定队列，我们可能把数据弄混乱。我们将看到如何实现队列。每个程序员都应该知道如何写一个队列，但是我们包括它，你从SDL的函数中学习。
+
+首先我们创建一个初始化队列的函数:
+
+    void packet_queue_init(PacketQueue *q) {
+      memset(q, 0, sizeof(PacketQueue));
+      q->mutex = SDL_CreateMutex();
+      q->cond = SDL_CreateCond();
+    }
+
+Then we will make a function to put stuff in our queue:
+int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
+
+  AVPacketList *pkt1;
+  if(av_dup_packet(pkt) < 0) {
+    return -1;
+  }
+  pkt1 = av_malloc(sizeof(AVPacketList));
+  if (!pkt1)
+    return -1;
+  pkt1->pkt = *pkt;
+  pkt1->next = NULL;
+  
+  
+  SDL_LockMutex(q->mutex);
+  
+  if (!q->last_pkt)
+    q->first_pkt = pkt1;
+  else
+    q->last_pkt->next = pkt1;
+  q->last_pkt = pkt1;
+  q->nb_packets++;
+  q->size += pkt1->pkt.size;
+  SDL_CondSignal(q->cond);
+  
+  SDL_UnlockMutex(q->mutex);
+  return 0;
+}
+SDL_LockMutex() locks the mutex in the queue so we can add something to it, and then SDL_CondSignal() sends a signal to our get function (if it is waiting) through our condition variable to tell it that there is data and it can proceed, then unlocks the mutex to let it go.
+Here's the corresponding get function. Notice how SDL_CondWait() makes the function block (i.e. pause until we get data) if we tell it to.
+
+int quit = 0;
+
+static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block) {
+  AVPacketList *pkt1;
+  int ret;
+  
+  SDL_LockMutex(q->mutex);
+  
+  for(;;) {
+    
+    if(quit) {
+      ret = -1;
+      break;
+    }
+
+    pkt1 = q->first_pkt;
+    if (pkt1) {
+      q->first_pkt = pkt1->next;
+      if (!q->first_pkt)
+	q->last_pkt = NULL;
+      q->nb_packets--;
+      q->size -= pkt1->pkt.size;
+      *pkt = pkt1->pkt;
+      av_free(pkt1);
+      ret = 1;
+      break;
+    } else if (!block) {
+      ret = 0;
+      break;
+    } else {
+      SDL_CondWait(q->cond, q->mutex);
+    }
+  }
+  SDL_UnlockMutex(q->mutex);
+  return ret;
+}
+As you can see, we've wrapped the function in a forever loop so we will be sure to get some data if we want to block. We avoid looping forever by making use of SDL's SDL_CondWait() function. Basically, all CondWait does is wait for a signal from SDL_CondSignal() (or SDL_CondBroadcast()) and then continue. However, it looks as though we've trapped it within our mutex — if we hold the lock, our put function can't put anything in the queue! However, what SDL_CondWait() also does for us is to unlock the mutex we give it and then attempt to lock it again once we get the signal.
+In Case of Fire
+
+You'll also notice that we have a global quit variable that we check to make sure that we haven't set the program a quit signal (SDL automatically handles TERM signals and the like). Otherwise, the thread will continue forever and we'll have to kill -9 the program.
+
+  SDL_PollEvent(&event);
+  switch(event.type) {
+  case SDL_QUIT:
+    quit = 1;
+We make sure to set the quit flag to 1.
+Feeding Packets
+
+The only thing left is to set up our queue:
+
+PacketQueue audioq;
+main() {
+...
+  avcodec_open2(aCodecCtx, aCodec, NULL);
+
+  packet_queue_init(&audioq);
+  SDL_PauseAudio(0);
+SDL_PauseAudio() finally starts the audio device. It plays silence if it doesn't get data; which it won't right away.
+So, we've got our queue set up, now we're ready to start feeding it packets. We go to our packet-reading loop:
+
+while(av_read_frame(pFormatCtx, &packet)>=0) {
+  // Is this a packet from the video stream?
+  if(packet.stream_index==videoStream) {
+    // Decode video frame
+    ....
+    }
+  } else if(packet.stream_index==audioStream) {
+    packet_queue_put(&audioq, &packet);
+  } else {
+    av_free_packet(&packet);
+  }
+Note that we don't free the packet after we put it in the queue. We'll free it later when we decode it.
+Fetching Packets
+
+Now let's finally make our audio_callback function to fetch the packets on the queue. The callback has to be of the form void callback(void *userdata, Uint8 *stream, int len), where userdata of course is the pointer we gave to SDL, stream is the buffer we will be writing audio data to, and len is the size of that buffer. Here's the code:
+
+void audio_callback(void *userdata, Uint8 *stream, int len) {
+
+  AVCodecContext *aCodecCtx = (AVCodecContext *)userdata;
+  int len1, audio_size;
+
+  static uint8_t audio_buf[(AVCODEC_MAX_AUDIO_FRAME_SIZE * 3) / 2];
+  static unsigned int audio_buf_size = 0;
+  static unsigned int audio_buf_index = 0;
+
+  while(len > 0) {
+    if(audio_buf_index >= audio_buf_size) {
+      /* We have already sent all our data; get more */
+      audio_size = audio_decode_frame(aCodecCtx, audio_buf,
+                                      sizeof(audio_buf));
+      if(audio_size < 0) {
+	/* If error, output silence */
+	audio_buf_size = 1024;
+	memset(audio_buf, 0, audio_buf_size);
+      } else {
+	audio_buf_size = audio_size;
+      }
+      audio_buf_index = 0;
+    }
+    len1 = audio_buf_size - audio_buf_index;
+    if(len1 > len)
+      len1 = len;
+    memcpy(stream, (uint8_t *)audio_buf + audio_buf_index, len1);
+    len -= len1;
+    stream += len1;
+    audio_buf_index += len1;
+  }
+}
+This is basically a simple loop that will pull in data from another function we will write, audio_decode_frame(), store the result in an intermediary buffer, attempt to write len bytes to stream, and get more data if we don't have enough yet, or save it for later if we have some left over. The size of audio_buf is 1.5 times the size of the largest audio frame that ffmpeg will give us, which gives us a nice cushion.
+Finally Decoding the Audio
+
+Let's get to the real meat of the decoder, audio_decode_frame:
+
+int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf,
+                       int buf_size) {
+
+  static AVPacket pkt;
+  static uint8_t *audio_pkt_data = NULL;
+  static int audio_pkt_size = 0;
+  static AVFrame frame;
+
+  int len1, data_size = 0;
+
+  for(;;) {
+    while(audio_pkt_size > 0) {
+      int got_frame = 0;
+      len1 = avcodec_decode_audio4(aCodecCtx, &frame, &got_frame, &pkt);
+      if(len1 < 0) {
+	/* if error, skip frame */
+	audio_pkt_size = 0;
+	break;
+      }
+      audio_pkt_data += len1;
+      audio_pkt_size -= len1;
+      data_size = 0;
+      if(got_frame) {
+	data_size = av_samples_get_buffer_size(NULL, 
+					       aCodecCtx->channels,
+					       frame.nb_samples,
+					       aCodecCtx->sample_fmt,
+					       1);
+	assert(data_size <= buf_size);
+	memcpy(audio_buf, frame.data[0], data_size);
+      }
+      if(data_size <= 0) {
+	/* No data yet, get more frames */
+	continue;
+      }
+      /* We have data, return it and come back for more later */
+      return data_size;
+    }
+    if(pkt.data)
+      av_free_packet(&pkt);
+
+    if(quit) {
+      return -1;
+    }
+
+    if(packet_queue_get(&audioq, &pkt, 1) < 0) {
+      return -1;
+    }
+    audio_pkt_data = pkt.data;
+    audio_pkt_size = pkt.size;
+  }
+}
+This whole process actually starts towards the end of the function, where we call packet_queue_get(). We pick the packet up off the queue, and save its information. Then, once we have a packet to work with, we call avcodec_decode_audio4(), which acts a lot like its sister function, avcodec_decode_video(), except in this case, a packet might have more than one frame, so you may have to call it several times to get all the data out of the packet. Once we have the frame, we simply copy it to our audio buffer, making sure the data_size is smaller than our audio buffer. Also, remember the cast to audio_buf, because SDL gives an 8 bit int buffer, and ffmpeg gives us data in a 16 bit int buffer. You should also notice the difference between len1 and data_size. len1 is how much of the packet we've used, and data_size is the amount of raw data returned.
+When we've got some data, we immediately return to see if we still need to get more data from the queue, or if we are done. If we still had more of the packet to process, we save it for later. If we finish up a packet, we finally get to free that packet.
+
+So that's it! We've got audio being carried from the main read loop to the queue, which is then read by the audio_callback function, which hands that data to SDL, which SDL beams to your sound card. Go ahead and compile:
+
+gcc -o tutorial03 tutorial03.c -lavutil -lavformat -lavcodec -lswscale -lz -lm \
+`sdl-config --cflags --libs`
+Hooray! The video is still going as fast as possible, but the audio is playing in time. Why is this? That's because the audio information has a sample rate — we're pumping out audio information as fast as we can, but the audio simply plays from that stream at its leisure according to the sample rate.
+We're almost ready to start syncing video and audio ourselves, but first we need to do a little program reorganization. The method of queueing up audio and playing it using a separate thread worked very well: it made the code more managable and more modular. Before we start syncing the video to the audio, we need to make our code easier to deal with. Next time: Spawning Threads!
+
+>> Spawning Threads
