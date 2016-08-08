@@ -67,7 +67,7 @@ ffplay是一个使用ffmpeg的示例程序。它是一个简单的C程序，使�
     // Dump information about file onto standard error
     av_dump_format(pFormatCtx, 0, argv[1], 0);
 
-Now pFormatCtx->streams is just an array of pointers, of size pFormatCtx->nb_streams, so let's walk through it until we find a video stream.
+pFormatCtx->streams 是一个指针数组， 数组的大小是 pFormatCtx->nb_streams，接下来让我们从这里面找到一个视频流
 
     int i;
     AVCodecContext *pCodecCtxOrig = NULL;
@@ -86,7 +86,7 @@ Now pFormatCtx->streams is just an array of pointers, of size pFormatCtx->nb_str
     // Get a pointer to the codec context for the video stream
     pCodecCtx=pFormatCtx->streams[videoStream]->codec;
 
-The stream's information about the codec is in what we call the "codec context." This contains all the information about the codec that the stream is using, and now we have a pointer to it. But we still have to find the actual codec and open it:
+这个流的编解码器(codec)信息存在"codec context"中，里面包含这个容器内所有流的编解码器，刚刚我们拿到了它的指针，但是我们仍然需要去找到并打开真正的编解码器。
 
     AVCodec *pCodec = NULL;
     
@@ -106,25 +106,25 @@ The stream's information about the codec is in what we call the "codec context."
     if(avcodec_open2(pCodecCtx, pCodec)<0)
       return -1; // Could not open codec
 
-Note that we must not use the AVCodecContext from the video stream directly! So we have to use avcodec_copy_context() to copy the context to a new location (after allocating memory for it, of course).
+需要注意的是我们不能直接使用视频流中的 AVCodecContext，所以，我们需要使用 avcodec_copy_context() 把 context 复制到一个新的位置（在分配新内存之后）。
 
-####Storing the Data
+####存储数据
 
-Now we need a place to actually store the frame:
+现在我们需要一个地方来存储帧:
 
     AVFrame *pFrame = NULL;
     
     // Allocate video frame
     pFrame=av_frame_alloc();
 
-Since we're planning to output PPM files, which are stored in 24-bit RGB, we're going to have to convert our frame from its native format to RGB. ffmpeg will do these conversions for us. For most projects (including ours) we're going to want to convert our initial frame to a specific format. Let's allocate a frame for the converted frame now.
+现在我们输出24位RGB的 PPM 文件，用ffmpeg把帧转成RGB的原生格式。大多数处理的时候，我们都是想把原格式转换成一个特定的格式，那么我们来分配一个用来转换帧的帧。
 
     // Allocate an AVFrame structure
     pFrameRGB=av_frame_alloc();
     if(pFrameRGB==NULL)
       return -1;
 
-Even though we've allocated the frame, we still need a place to put the raw data when we convert it. We use avpicture_get_size to get the size we need, and allocate the space manually:
+即使我们分配了帧，当我们转码帧的时候仍需要一个空间，所以我们需要 avpicture_get_size 来获取大小，并分配相应大小的空间。
 
     uint8_t *buffer = NULL;
     int numBytes;
@@ -132,19 +132,21 @@ Even though we've allocated the frame, we still need a place to put the raw data
     numBytes=avpicture_get_size(PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height);
     buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
 
-av_malloc is ffmpeg's malloc that is just a simple wrapper around malloc that makes sure the memory addresses are aligned and such. It will not protect you from memory leaks, double freeing, or other malloc problems.
-Now we use avpicture_fill to associate the frame with our newly allocated buffer. About the AVPicture cast: the AVPicture struct is a subset of the AVFrame struct - the beginning of the AVFrame struct is identical to the AVPicture struct.
+av_malloc是ffmpeg的malloc,它包装malloc以确保内存地址对齐。但它不保证内存泄漏,双释放,或其他malloc问题。
+
+现在，我们使用avpicture_fill来把帧填充到我们新的缓冲区。
+AVPicture：AVPicture结构是AVFrame结构的子集，最开始的时候，AVFrame和AVPicture是一样的。
 
     // Assign appropriate parts of buffer to image planes in pFrameRGB
     // Note that pFrameRGB is an AVFrame, but AVFrame is a superset
     // of AVPicture
     avpicture_fill((AVPicture *)pFrameRGB, buffer, PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height);
 
-Finally! Now we're ready to read from the stream!
+最后，我们准备读取流数据。
 
-####Reading the Data
+####读取数据
 
-What we're going to do is read through the entire video stream by reading in the packet, decoding it into our frame, and once our frame is complete, we will convert and save it.
+我们现在要做的是读取整个视频流，读取packet，把它解码成帧，得到帧之后把它转换并保存。
 
     struct SwsContext *sws_ctx = NULL;
     int frameFinished;
@@ -187,11 +189,12 @@ What we're going to do is read through the entire video stream by reading in the
       av_free_packet(&packet);
     }
 
-A note on packets
-Technically a packet can contain partial frames or other bits of data, but ffmpeg's parser ensures that the packets we get contain either complete or multiple frames.
+备注：
+packet 理论上可以包含一部分帧和一些其它数据，但是ffmpeg的解析器保证了，我们会获得完整的一个或多个帧。
 
-The process, again, is simple: av_read_frame() reads in a packet and stores it in the AVPacket struct. Note that we've only allocated the packet structure - ffmpeg allocates the internal data for us, which is pointed to by packet.data. This is freed by the av_free_packet() later. avcodec_decode_video() converts the packet to a frame for us. However, we might not have all the information we need for a frame after decoding a packet, so avcodec_decode_video() sets frameFinished for us when we have the next frame. Finally, we use sws_scale() to convert from the native format (pCodecCtx->pix_fmt) to RGB. Remember that you can cast an AVFrame pointer to an AVPicture pointer. Finally, we pass the frame and height and width information to our SaveFrame function.
-Now all we need to do is make the SaveFrame function to write the RGB information to a file in PPM format. We're going to be kind of sketchy on the PPM format itself; trust us, it works.
+简单说一下这个过程：av_read_frame()读取packet并把它存储到 AVPacket 结构中。注意，我们只分配packet结构，而ffmpeg为我们分配内部数据，用packet.data获取。之后由 av_free_packet() 进行释放。avcodec_decode_video()把packet转换成帧。然而，解码后可能没有我们需要的全部信息，所以如果有下一帧，则使用avcodec_decode_video()设置frameFinished。最后，使用sws_scale()去把原生格式(native format (pCodecCtx->pix_fmt))转成RGB数据。记住，我们可以把一个AVFrame指针指向一个AVPicture指针。最后，通过帧、高和宽的信息调用我们的 SaveFrame 方法。
+
+现在我们来写 SaveFrame 方法，用它把 RGB 数据写入一个 PPM 文件。
 
     void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame) {
       FILE *pFile;
@@ -215,8 +218,10 @@ Now all we need to do is make the SaveFrame function to write the RGB informatio
       fclose(pFile);
     }
 
-We do a bit of standard file opening, etc., and then write the RGB data. We write the file one line at a time. A PPM file is simply a file that has RGB information laid out in a long string. If you know HTML colors, it would be like laying out the color of each pixel end to end like #ff0000#ff0000.... would be a red screen. (It's stored in binary and without the separator, but you get the idea.) The header indicated how wide and tall the image is, and the max size of the RGB values.
-Now, going back to our main() function. Once we're done reading from the video stream, we just have to clean everything up:
+
+先做一些标准的文件处理工作，比如打开等等，然后写入 RGB 数据。一次写入文件的一行。PPM文件只是一个把RGB信息写成一个长字符串的文件。如果用过HTML的颜色，就会知道一个红色的屏幕，就是把每个像素都设置成 #ff0000#ff0000......。（没有分割符的二进制存储）头部中包含宽度、高度和RGB的最大大小。
+
+现在回到我们的main函数，一旦我们读完视频流，我们需要清空所有的东西:
 
     // Free the RGB image
     av_free(buffer);
@@ -234,13 +239,14 @@ Now, going back to our main() function. Once we're done reading from the video s
     
     return 0;
 
-You'll notice we use av_free for the memory we allocated with avcode_alloc_frame and av_malloc.
-That's it for the code! Now, if you're on Linux or a similar platform, you'll run:
+avcode_alloc_frame 和 av_malloc 分配的内存，我们使用 av_free 进行清理。
+
+现在我们来运行它(linux 或者类型平台)：
 
     gcc -o tutorial01 tutorial01.c -lavutil -lavformat -lavcodec -lz -lavutil -lm
 
-If you have an older version of ffmpeg, you may need to drop -lavutil:
+如果是旧版本的ffmpeg，可能需要去掉 -lavutil 选项运行：
 
     gcc -o tutorial01 tutorial01.c -lavformat -lavcodec -lz -lm
 
-Most image programs should be able to open PPM files. Test it on some movie files.
+大部分的图像工具都可以打开 PPM 文件，可以测试一些电影文件。
