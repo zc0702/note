@@ -307,7 +307,7 @@ SDL_GetError() 是为了方便调试bug。
 
 很简单吧！现在我们只需要显示图片了，我们用显示代码替换掉 SaveFrame() 方法。显示图像，我们需要创建一个 AVPicture 结构，然后设置数据指针和linesize，并把它设置给我们的 YUV overlay：
 
-      if(frameFinished) {
+    if(frameFinished) {
         SDL_LockYUVOverlay(bmp);
     
         AVPicture pict;
@@ -325,7 +325,7 @@ SDL_GetError() 是为了方便调试bug。
     	      pict.data, pict.linesize);
         
         SDL_UnlockYUVOverlay(bmp);
-      }
+    }
 
 首先，因为我们需要写 overlay，所以我们先锁定它。这是一个保证之后不会产生问题的好习惯。AVPicture 结构，正如上面展示的，有一个指向4个指针的数组的指针。因为我们现在处理 YUV420P，我们只有3个通道，因为只有3组数据。其它格式可能有第四个指针用来做透明度或者其它的。linesize 跟YUV overlay中像素和球(pitches)变量类似（pitches 是SDL中用来指定宽度线的数据）。所以我们要做的是把 pict.data 中的三个数组放入我们的 overlay，那么当我们写入 pict 的时候，我们实际上把它写入到我们已经分配好空间的 overlay。同样的，我们得到了 linesize 数据，我们把它转换成 PIX_FMT_YUV420P 格式，然后像之前一样使用 sws_scale。
 
@@ -335,7 +335,7 @@ SDL_GetError() 是为了方便调试bug。
 
     SDL_Rect rect;
     
-      if(frameFinished) {
+    if(frameFinished) {
         /* ... code ... */
         // Convert the image into YUV format that SDL uses
         sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
@@ -348,7 +348,7 @@ SDL_GetError() 是为了方便调试bug。
     	rect.w = pCodecCtx->width;
     	rect.h = pCodecCtx->height;
     	SDL_DisplayYUVOverlay(bmp, &rect);
-      }
+    }
 
 现在，我们的视频显示出来了！！
 
@@ -356,21 +356,20 @@ SDL_GetError() 是为了方便调试bug。
 
     SDL_Event       event;
     
-        av_free_packet(&packet);
-        SDL_PollEvent(&event);
-        switch(event.type) {
-        case SDL_QUIT:
-          SDL_Quit();
-          exit(0);
-          break;
-        default:
-          break;
-        }
+    av_free_packet(&packet);
+    SDL_PollEvent(&event);
+    switch(event.type) {
+      case SDL_QUIT:
+        SDL_Quit();
+        exit(0);
+        break;
+      default:
+        break;
+    }
 
 现在我们编译一下，使用SDL最好的编译方式如下：
 
-    gcc -o tutorial02 tutorial02.c -lavformat -lavcodec -lswscale -lz -lm \
-    `sdl-config --cflags --libs`
+    gcc -o tutorial02 tutorial02.c -lavformat -lavcodec -lswscale -lz -lm `sdl-config --cflags --libs`
 
 如果gcc包含了正确的sdl的库，sdl-config会打印出正确的flags。在不同的系统上编译可能需要做一些不同的事情，可以查看SDL文档，然后编译运行它。
 
