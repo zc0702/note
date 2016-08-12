@@ -870,7 +870,7 @@ SDL_CreateThread() 创建一个能访问原处理中所有内存的线程，并�
       }
     }
 
-This is pretty much the same as the code we had before, except now it's generalized for audio and video. Notice that instead of aCodecCtx, we've set up our big struct as the userdata for our audio callback. We've also saved the streams themselves as audio_st and video_st. We also have added our video queue and set it up in the same way we set up our audio queue. Most of the point is to launch the video and audio threads. These bits do it:
+这跟之前的代码基本一样，只是它包含了音频和视频。注意不是aCodecCtx，我们为音频回调在VideoState中设置了userdata。还把音视频流保存在 audio_st 和 video_st 中。创建一个跟音频队列一样的视频队列:
 
     SDL_PauseAudio(0);
     break;
@@ -879,8 +879,9 @@ This is pretty much the same as the code we had before, except now it's generali
 
     is->video_tid = SDL_CreateThread(video_thread, is);
 
-We remember SDL_PauseAudio() from last time, and SDL_CreateThread() is used as in the exact same way as before. We'll get back to our video_thread() function.
-Before that, let's go back to the second half of our decode_thread() function. It's basically just a for loop that will read in a packet and put it on the right queue:
+SDL_CreateThread()的用法跟前面的 SDL_PauseAudio() 一样。接下来，我们回到video_thread()函数。
+
+在此之前，我们先看decode_thread()。它是一个for循环，读取 packet 并把它存到正确的队列中:
 
       for(;;) {
         if(is->quit) {
@@ -910,8 +911,9 @@ Before that, let's go back to the second half of our decode_thread() function. I
         }
       }
 
-Nothing really new here, except that we now have a max size for our audio and video queue, and we've added a check for read errors. The format context has a ByteIOContext struct inside it called pb. ByteIOContext is the structure that basically keeps all the low-level file information in it.
-After our for loop, we have all the code for waiting for the rest of the program to end or informing it that we've ended. This code is instructive because it shows us how we push events - something we'll have to later to display the video.
+现在我们有了音视频队列的最大size，我们增加了对读取错误的确认。格式上下文（format context）包含了一个ByteIOContext结构体，称作 pb。ByteIOContext结构体中保持了所有低级别的文件信息。
+
+在循环之后，我们有等待程序结束或者通知它已经结束的代码。这段代码说明了如何推送事件，之后视频显示我们也会用到它。
 
       while(!is->quit) {
         SDL_Delay(100);
@@ -926,10 +928,11 @@ After our for loop, we have all the code for waiting for the rest of the program
       }
       return 0;
 
-We get values for user events by using the SDL constant SDL_USEREVENT. The first user event should be assigned the value SDL_USEREVENT, the next SDL_USEREVENT + 1, and so on. FF_QUIT_EVENT is defined in our program as SDL_USEREVENT + 1. We can also pass user data if we like, too, and here we pass our pointer to the big struct. Finally we call SDL_PushEvent(). In our event loop switch, we just put this by the SDL_QUIT_EVENT section we had before. We'll see our event loop in more detail; for now, just be assured that when we push the FF_QUIT_EVENT, we'll catch it later and raise our quit flag.
-Getting the Frame: video_thread
+使用SDL的SDL_USEREVENT自定义用户事件，第一个用户事件应该是SDL_USEREVENT，下一个就是SDL_USEREVENT+1，以此类推。FF_QUIT_EVENT我们用SDL_USEREVENT+1定义。我们也可以传递用户数据，如果我们愿意，也可以把传递的指针指向VideoState结构体。最后调用 SDL_PushEvent()。
 
-After we have our codec prepared, we start our video thread. This thread reads in packets from the video queue, decodes the video into frames, and then calls a queue_picture function to put the processed frame onto a picture queue:
+####获取帧: video_thread
+
+编解码器准备好之后，我们开始视频线程。这个线程从视频队列中读取packets，视频解码成帧，然后调用queue_picture函数把处理好的帧放到图像队列上（picture queue）:
 
     int video_thread(void *arg) {
       VideoState *is = (VideoState *)arg;
@@ -959,10 +962,11 @@ After we have our codec prepared, we start our video thread. This thread reads i
       return 0;
     }
 
-Most of this function should be familiar by this point. We've moved our avcodec_decode_video2 function here, just replaced some of the arguments; for example, we have the AVStream stored in our big struct, so we get our codec from there. We just keep getting packets from our video queue until someone tells us to quit or we encounter an error.
-Queueing the Frame
+我们把avcodec_decode_video2函数替换到这，只需要替换一些参数。例如，我们有AVStream存储我们的VideoState，所以我们从这获取codec。我们持续的从视频队列中获取packets，只到退出或者出错。
 
-Let's look at the function that stores our decoded frame, pFrame in our picture queue. Since our picture queue is an SDL overlay (presumably to allow the video display function to have as little calculation as possible), we need to convert our frame into that. The data we store in the picture queue is a struct of our making:
+####帧队列
+
+让我们看看存储解码后的帧，P帧到图像队列中的函数。图像队列是一个SDL覆盖（overlay），我们需要在这里面转换帧。我们做了一个用来把数据存储到图像队列的结构体:
 
     typedef struct VideoPicture {
       SDL_Overlay *bmp;
@@ -970,9 +974,9 @@ Let's look at the function that stores our decoded frame, pFrame in our picture 
       int allocated;
     } VideoPicture;
 
-Our big struct has a buffer of these in it where we can store them. However, we need to allocate the SDL_Overlay ourselves (notice the allocated flag that will indicate whether we have done so or not).
+VideoState中含有缓冲区，我们需要分配SDL_Overlay。
 
-To use this queue, we have two pointers - the writing index and the reading index. We also keep track of how many actual pictures are in the buffer. To write to the queue, we're going to first wait for our buffer to clear out so we have space to store our VideoPicture. Then we check and see if we have already allocated the overlay at our writing index. If not, we'll have to allocate some space. We also have to reallocate the buffer if the size of the window has changed!
+使用这个队列，我们有两个指针（写索引和读索引）。我们在缓冲区中跟踪一些图片。在写入队列之前，我们要先等缓冲区清空，那样才有空间用来存储VideoPicture。然后检查我们是否已经给我们的写索引分配好覆盖（overlay），如果没有我们需要分配一定的空间。如果窗口大小改变，我们也需要重新分配缓冲区。
 
     int queue_picture(VideoState *is, AVFrame *pFrame) {
     
