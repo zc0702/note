@@ -1202,3 +1202,222 @@ SDL_AddTimer() 是一个SDL函数，它能够在指定的毫秒数之后回调�
     gcc -o tutorial04 tutorial04.c -lavutil -lavformat -lavcodec -lswscale -lz -lm `sdl-config --cflags --libs`
 
 享受音视频不同步的视频吧，^0^! 下一章我们将做一个可以正常工作的播放器!
+
+###第五章：视频同步
+
+> Code: [tutorial05.c](http://dranger.com/ffmpeg/tutorial05.c)
+
+####准备知识
+
+当我第一次做这个教程，我所有的同步代码从ffplay.c拉。今天，它是一个完全不同的程序，因为ffmpeg一些策略的改变而进行改进。虽然代码仍然有效，但它看起来并不好，本教程能够用这些改进。
+
+#####如何同步视频
+
+我们现在有了一个播放器，它可以播放视频，也可以播放音频，但是它播放出来的内容不是一个完整的电影（或视频）。
+
+#####PTS and DTS
+
+音频和视频流的信息中包含了它播放的信息。音频流的采样率和视频流的帧率（每秒播放帧的个数）。但是，如果我们只是简单地把帧和帧率相乘用作视频同步的话，是有可能跟音频不同步的。所以，从流的packets中，可能得到解码时间戳（decoding time stamp（DTS））和显示时间戳（presentation time stamp（PTS））。要了解这两个值，我们需要了解视频的存储方式。如MPEG格式，使用他们所谓的“B”帧（B代表“双向（bidirectional）”）。其他两个类型的帧被称作“I”帧和“P”帧（“I”为“内部（intra）”和“P”代表“预言（predicted）”）。 I帧包含完整的图像。 P帧依赖于以前的I和P帧，包含图像的不同之处或增量。 B帧跟P帧类似，但它依赖于在它之前和之后的帧的信息！这就解释了在调用avcodec_decode_video2之后，为什么我们可能不会有一个完整帧。
+
+所以说我们有一个视频，并且帧被显示成：I B B P。那现在我们需要知道P帧中的信息之前，我们可以显示B帧，正因如此，这些帧也可以存储成这样：I P B B。这就是为什么每一帧要有解码时间戳和显示时间戳。解码时间戳告诉我们什么时候需要解码，显示时间长告诉我们什么时候需要显示。因此在这，我们的流可能是这样的:
+
+       PTS: 1 4 2 3
+       DTS: 1 2 3 4
+    Stream: I P B B
+
+通常 PTS 和 DTS 只有当流中包含B帧的时候会有不同。
+
+从 av_read_frame() 中获取一个 packet 时，它将会包含packet中的PTS和DTS值的信息。但是我们真正想要的是我们解码出来的原始帧的PTS，这样我们才知道什么时候显示它。
+
+幸运的是，FFmpeg给我们提供了一个“尽可能接近”的时间戳，可以通过 av_frame_get_best_effort_timestamp() 获取。
+
+#####同步
+
+Now, while it's all well and good to know when we're supposed to show a particular video frame, but how do we actually do so? Here's the idea: after we show a frame, we figure out when the next frame should be shown. Then we simply set a new timeout to refresh the video again after that amount of time. As you might expect, we check the value of the PTS of the next frame against the system clock to see how long our timeout should be. This approach works, but there are two issues that need to be dealt with.
+
+First is the issue of knowing when the next PTS will be. Now, you might think that we can just add the video rate to the current PTS — and you'd be mostly right. However, some kinds of video call for frames to be repeated. This means that we're supposed to repeat the current frame a certain number of times. This could cause the program to display the next frame too soon. So we need to account for that.
+
+The second issue is that as the program stands now, the video and the audio chugging away happily, not bothering to sync at all. We wouldn't have to worry about that if everything worked perfectly. But your computer isn't perfect, and a lot of video files aren't, either. So we have three choices: sync the audio to the video, sync the video to the audio, or sync both to an external clock (like your computer). For now, we're going to sync the video to the audio.
+
+Coding it: getting the frame PTS
+
+Now let's get into the code to do all this. We're going to need to add some more members to our big struct, but we'll do this as we need to. First let's look at our video thread. Remember, this is where we pick up the packets that were put on the queue by our decode thread. What we need to do in this part of the code is get the PTS of the frame given to us by avcodec_decode_video2. The first way we talked about was getting the DTS of the last packet processed, which is pretty easy:
+
+  double pts;
+
+  for(;;) {
+    if(packet_queue_get(&is->videoq, packet, 1) < 0) {
+      // means we quit getting packets
+      break;
+    }
+    pts = 0;
+    // Decode video frame
+    len1 = avcodec_decode_video2(is->video_st->codec,
+                                pFrame, &frameFinished, packet);
+    if(packet->dts != AV_NOPTS_VALUE) {
+      pts = av_frame_get_best_effort_timestamp(pFrame);
+    } else {
+      pts = 0;
+    }
+    pts *= av_q2d(is->video_st->time_base);
+We set the PTS to 0 if we can't figure out what it is.
+Well, that was easy. A technical note: You may have noticed we're using int64 for the PTS. This is because the PTS is stored as an integer. This value is a timestamp that corresponds to a measurement of time in that stream's time_base unit. For example, if a stream has 24 frames per second, a PTS of 42 is going to indicate that the frame should go where the 42nd frame would be if there we had a frame every 1/24 of a second (certainly not necessarily true).
+
+We can convert this value to seconds by dividing by the framerate. The time_base value of the stream is going to be 1/framerate (for fixed-fps content), so to get the PTS in seconds, we multiply by the time_base.
+
+Coding: Synching and using the PTS
+
+So now we've got our PTS all set. Now we've got to take care of the two synchronization problems we talked about above. We're going to define a function called synchronize_video that will update the PTS to be in sync with everything. This function will also finally deal with cases where we don't get a PTS value for our frame. At the same time we need to keep track of when the next frame is expected so we can set our refresh rate properly. We can accomplish this by using an internal video_clock value which keeps track of how much time has passed according to the video. We add this value to our big struct.
+
+typedef struct VideoState {
+  double          video_clock; // pts of last decoded frame / predicted pts of next decoded frame
+Here's the synchronize_video function, which is pretty self-explanatory:
+double synchronize_video(VideoState *is, AVFrame *src_frame, double pts) {
+
+  double frame_delay;
+
+  if(pts != 0) {
+    /* if we have pts, set video clock to it */
+    is->video_clock = pts;
+  } else {
+    /* if we aren't given a pts, set it to the clock */
+    pts = is->video_clock;
+  }
+  /* update the video clock */
+  frame_delay = av_q2d(is->video_st->codec->time_base);
+  /* if we are repeating a frame, adjust clock accordingly */
+  frame_delay += src_frame->repeat_pict * (frame_delay * 0.5);
+  is->video_clock += frame_delay;
+  return pts;
+}
+You'll notice we account for repeated frames in this function, too.
+Now let's get our proper PTS and queue up the frame using queue_picture, adding a new pts argument:
+
+    // Did we get a video frame?
+    if(frameFinished) {
+      pts = synchronize_video(is, pFrame, pts);
+      if(queue_picture(is, pFrame, pts) < 0) {
+	break;
+      }
+    }
+The only thing that changes about queue_picture is that we save that pts value to the VideoPicture structure that we queue up. So we have to add a pts variable to the struct and add a line of code:
+typedef struct VideoPicture {
+  ...
+  double pts;
+}
+int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
+  ... stuff ...
+  if(vp->bmp) {
+    ... convert picture ...
+    vp->pts = pts;
+    ... alert queue ...
+  }
+So now we've got pictures lining up onto our picture queue with proper PTS values, so let's take a look at our video refreshing function. You may recall from last time that we just faked it and put a refresh of 80ms. Well, now we're going to find out how to actually figure it out.
+Our strategy is going to be to predict the time of the next PTS by simply measuring the time between the previous pts and this one. At the same time, we need to sync the video to the audio. We're going to make an audio clock: an internal value thatkeeps track of what position the audio we're playing is at. It's like the digital readout on any mp3 player. Since we're synching the video to the audio, the video thread uses this value to figure out if it's too far ahead or too far behind.
+
+We'll get to the implementation later; for now let's assume we have a get_audio_clock function that will give us the time on the audio clock. Once we have that value, though, what do we do if the video and audio are out of sync? It would silly to simply try and leap to the correct packet through seeking or something. Instead, we're just going to adjust the value we've calculated for the next refresh: if the PTS is too far behind the audio time, we double our calculated delay. if the PTS is too far ahead of the audio time, we simply refresh as quickly as possible. Now that we have our adjusted refresh time, or delay, we're going to compare that with our computer's clock by keeping a running frame_timer. This frame timer will sum up all of our calculated delays while playing the movie. In other words, this frame_timer is what time it should be when we display the next frame. We simply add the new delay to the frame timer, compare it to the time on our computer's clock, and use that value to schedule the next refresh. This might be a bit confusing, so study the code carefully:
+
+void video_refresh_timer(void *userdata) {
+
+  VideoState *is = (VideoState *)userdata;
+  VideoPicture *vp;
+  double actual_delay, delay, sync_threshold, ref_clock, diff;
+  
+  if(is->video_st) {
+    if(is->pictq_size == 0) {
+      schedule_refresh(is, 1);
+    } else {
+      vp = &is->pictq[is->pictq_rindex];
+
+      delay = vp->pts - is->frame_last_pts; /* the pts from last time */
+      if(delay <= 0 || delay >= 1.0) {
+	/* if incorrect delay, use previous one */
+	delay = is->frame_last_delay;
+      }
+      /* save for next time */
+      is->frame_last_delay = delay;
+      is->frame_last_pts = vp->pts;
+
+      /* update delay to sync to audio */
+      ref_clock = get_audio_clock(is);
+      diff = vp->pts - ref_clock;
+
+      /* Skip or repeat the frame. Take delay into account
+	 FFPlay still doesn't "know if this is the best guess." */
+      sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
+      if(fabs(diff) < AV_NOSYNC_THRESHOLD) {
+	if(diff <= -sync_threshold) {
+	  delay = 0;
+	} else if(diff >= sync_threshold) {
+	  delay = 2 * delay;
+	}
+      }
+      is->frame_timer += delay;
+      /* computer the REAL delay */
+      actual_delay = is->frame_timer - (av_gettime() / 1000000.0);
+      if(actual_delay < 0.010) {
+	/* Really it should skip the picture instead */
+	actual_delay = 0.010;
+      }
+      schedule_refresh(is, (int)(actual_delay * 1000 + 0.5));
+      /* show the picture! */
+      video_display(is);
+      
+      /* update queue for next picture! */
+      if(++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
+	is->pictq_rindex = 0;
+      }
+      SDL_LockMutex(is->pictq_mutex);
+      is->pictq_size--;
+      SDL_CondSignal(is->pictq_cond);
+      SDL_UnlockMutex(is->pictq_mutex);
+    }
+  } else {
+    schedule_refresh(is, 100);
+  }
+}
+There are a few checks we make: first, we make sure that the delay between the PTS and the previous PTS make sense. If it doesn't we just guess and use the last delay. Next, we make sure we have a synch threshold because things are never going to be perfectly in synch. ffplay uses 0.01 for its value. We also make sure that the synch threshold is never smaller than the gaps in between PTS values. Finally, we make the minimum refresh value 10 milliseconds*.* Really here we should skip the frame, but we're not going to bother.
+We added a bunch of variables to the big struct so don't forget to check the code. Also, don't forget to initialize the frame timer and the initial previous frame delay in stream_component_open:
+
+    is->frame_timer = (double)av_gettime() / 1000000.0;
+    is->frame_last_delay = 40e-3;
+Synching: The Audio Clock
+
+Now it's time for us to implement the audio clock. We can update the clock time in our audio_decode_frame function, which is where we decode the audio. Now, remember that we don't always process a new packet every time we call this function, so there are two places we have to update the clock at. The first place is where we get the new packet: we simply set the audio clock to the packet's PTS. Then if a packet has multiple frames, we keep time the audio play by counting the number of samples and multiplying them by the given samples-per-second rate. So once we have the packet:
+
+    /* if update, update the audio clock w/pts */
+    if(pkt->pts != AV_NOPTS_VALUE) {
+      is->audio_clock = av_q2d(is->audio_st->time_base)*pkt->pts;
+    }
+And once we are processing the packet:
+      /* Keep audio_clock up-to-date */
+      pts = is->audio_clock;
+      *pts_ptr = pts;
+      n = 2 * is->audio_st->codec->channels;
+      is->audio_clock += (double)data_size /
+	(double)(n * is->audio_st->codec->sample_rate);
+A few fine details: the template of the function has changed to include pts_ptr, so make sure you change that. pts_ptr is a pointer we use to inform audio_callback the pts of the audio packet. This will be used next time for synchronizing the audio with the video.
+Now we can finally implement our get_audio_clock function. It's not as simple as getting the is->audio_clock value, thought. Notice that we set the audio PTS every time we process it, but if you look at the audio_callback function, it takes time to move all the data from our audio packet into our output buffer. That means that the value in our audio clock could be too far ahead. So we have to check how much we have left to write. Here's the complete code:
+
+double get_audio_clock(VideoState *is) {
+  double pts;
+  int hw_buf_size, bytes_per_sec, n;
+  
+  pts = is->audio_clock; /* maintained in the audio thread */
+  hw_buf_size = is->audio_buf_size - is->audio_buf_index;
+  bytes_per_sec = 0;
+  n = is->audio_st->codec->channels * 2;
+  if(is->audio_st) {
+    bytes_per_sec = is->audio_st->codec->sample_rate * n;
+  }
+  if(bytes_per_sec) {
+    pts -= (double)hw_buf_size / bytes_per_sec;
+  }
+  return pts;
+}
+You should be able to tell why this function works by now ;)
+So that's it! Go ahead and compile it:
+
+gcc -o tutorial05 tutorial05.c -lavutil -lavformat -lavcodec -lswscale -lz -lm \
+`sdl-config --cflags --libs`
+and finally! you can watch a movie on your own movie player. Next time we'll look at audio synching, and then the tutorial after that we'll talk about seeking.
