@@ -1239,185 +1239,572 @@ First is the issue of knowing when the next PTS will be. Now, you might think th
 
 The second issue is that as the program stands now, the video and the audio chugging away happily, not bothering to sync at all. We wouldn't have to worry about that if everything worked perfectly. But your computer isn't perfect, and a lot of video files aren't, either. So we have three choices: sync the audio to the video, sync the video to the audio, or sync both to an external clock (like your computer). For now, we're going to sync the video to the audio.
 
-Coding it: getting the frame PTS
+####Coding it: getting the frame PTS
 
 Now let's get into the code to do all this. We're going to need to add some more members to our big struct, but we'll do this as we need to. First let's look at our video thread. Remember, this is where we pick up the packets that were put on the queue by our decode thread. What we need to do in this part of the code is get the PTS of the frame given to us by avcodec_decode_video2. The first way we talked about was getting the DTS of the last packet processed, which is pretty easy:
 
-  double pts;
+      double pts;
+    
+      for(;;) {
+        if(packet_queue_get(&is->videoq, packet, 1) < 0) {
+          // means we quit getting packets
+          break;
+        }
+        pts = 0;
+        // Decode video frame
+        len1 = avcodec_decode_video2(is->video_st->codec, pFrame, &frameFinished, packet);
+        if(packet->dts != AV_NOPTS_VALUE) {
+          pts = av_frame_get_best_effort_timestamp(pFrame);
+        } else {
+          pts = 0;
+        }
+        pts *= av_q2d(is->video_st->time_base);
 
-  for(;;) {
-    if(packet_queue_get(&is->videoq, packet, 1) < 0) {
-      // means we quit getting packets
-      break;
-    }
-    pts = 0;
-    // Decode video frame
-    len1 = avcodec_decode_video2(is->video_st->codec,
-                                pFrame, &frameFinished, packet);
-    if(packet->dts != AV_NOPTS_VALUE) {
-      pts = av_frame_get_best_effort_timestamp(pFrame);
-    } else {
-      pts = 0;
-    }
-    pts *= av_q2d(is->video_st->time_base);
 We set the PTS to 0 if we can't figure out what it is.
 Well, that was easy. A technical note: You may have noticed we're using int64 for the PTS. This is because the PTS is stored as an integer. This value is a timestamp that corresponds to a measurement of time in that stream's time_base unit. For example, if a stream has 24 frames per second, a PTS of 42 is going to indicate that the frame should go where the 42nd frame would be if there we had a frame every 1/24 of a second (certainly not necessarily true).
 
 We can convert this value to seconds by dividing by the framerate. The time_base value of the stream is going to be 1/framerate (for fixed-fps content), so to get the PTS in seconds, we multiply by the time_base.
 
-Coding: Synching and using the PTS
+####Coding: Synching and using the PTS
 
 So now we've got our PTS all set. Now we've got to take care of the two synchronization problems we talked about above. We're going to define a function called synchronize_video that will update the PTS to be in sync with everything. This function will also finally deal with cases where we don't get a PTS value for our frame. At the same time we need to keep track of when the next frame is expected so we can set our refresh rate properly. We can accomplish this by using an internal video_clock value which keeps track of how much time has passed according to the video. We add this value to our big struct.
 
-typedef struct VideoState {
-  double          video_clock; // pts of last decoded frame / predicted pts of next decoded frame
+    typedef struct VideoState {
+      double          video_clock; // pts of last decoded frame / predicted pts of next decoded frame
+
 Here's the synchronize_video function, which is pretty self-explanatory:
-double synchronize_video(VideoState *is, AVFrame *src_frame, double pts) {
 
-  double frame_delay;
+    double synchronize_video(VideoState *is, AVFrame *src_frame, double pts) {
+    
+      double frame_delay;
+    
+      if(pts != 0) {
+        /* if we have pts, set video clock to it */
+        is->video_clock = pts;
+      } else {
+        /* if we aren't given a pts, set it to the clock */
+        pts = is->video_clock;
+      }
+      /* update the video clock */
+      frame_delay = av_q2d(is->video_st->codec->time_base);
+      /* if we are repeating a frame, adjust clock accordingly */
+      frame_delay += src_frame->repeat_pict * (frame_delay * 0.5);
+      is->video_clock += frame_delay;
+      return pts;
+    }
 
-  if(pts != 0) {
-    /* if we have pts, set video clock to it */
-    is->video_clock = pts;
-  } else {
-    /* if we aren't given a pts, set it to the clock */
-    pts = is->video_clock;
-  }
-  /* update the video clock */
-  frame_delay = av_q2d(is->video_st->codec->time_base);
-  /* if we are repeating a frame, adjust clock accordingly */
-  frame_delay += src_frame->repeat_pict * (frame_delay * 0.5);
-  is->video_clock += frame_delay;
-  return pts;
-}
 You'll notice we account for repeated frames in this function, too.
 Now let's get our proper PTS and queue up the frame using queue_picture, adding a new pts argument:
 
-    // Did we get a video frame?
-    if(frameFinished) {
-      pts = synchronize_video(is, pFrame, pts);
-      if(queue_picture(is, pFrame, pts) < 0) {
-	break;
-      }
-    }
+        // Did we get a video frame?
+        if(frameFinished) {
+          pts = synchronize_video(is, pFrame, pts);
+          if(queue_picture(is, pFrame, pts) < 0) {
+    	    break;
+          }
+        }
+
 The only thing that changes about queue_picture is that we save that pts value to the VideoPicture structure that we queue up. So we have to add a pts variable to the struct and add a line of code:
-typedef struct VideoPicture {
-  ...
-  double pts;
-}
-int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
-  ... stuff ...
-  if(vp->bmp) {
-    ... convert picture ...
-    vp->pts = pts;
-    ... alert queue ...
-  }
+
+    typedef struct VideoPicture {
+      ...
+      double pts;
+    }
+    int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
+      ... stuff ...
+      if(vp->bmp) {
+        ... convert picture ...
+        vp->pts = pts;
+        ... alert queue ...
+      }
+
 So now we've got pictures lining up onto our picture queue with proper PTS values, so let's take a look at our video refreshing function. You may recall from last time that we just faked it and put a refresh of 80ms. Well, now we're going to find out how to actually figure it out.
 Our strategy is going to be to predict the time of the next PTS by simply measuring the time between the previous pts and this one. At the same time, we need to sync the video to the audio. We're going to make an audio clock: an internal value thatkeeps track of what position the audio we're playing is at. It's like the digital readout on any mp3 player. Since we're synching the video to the audio, the video thread uses this value to figure out if it's too far ahead or too far behind.
 
 We'll get to the implementation later; for now let's assume we have a get_audio_clock function that will give us the time on the audio clock. Once we have that value, though, what do we do if the video and audio are out of sync? It would silly to simply try and leap to the correct packet through seeking or something. Instead, we're just going to adjust the value we've calculated for the next refresh: if the PTS is too far behind the audio time, we double our calculated delay. if the PTS is too far ahead of the audio time, we simply refresh as quickly as possible. Now that we have our adjusted refresh time, or delay, we're going to compare that with our computer's clock by keeping a running frame_timer. This frame timer will sum up all of our calculated delays while playing the movie. In other words, this frame_timer is what time it should be when we display the next frame. We simply add the new delay to the frame timer, compare it to the time on our computer's clock, and use that value to schedule the next refresh. This might be a bit confusing, so study the code carefully:
 
-void video_refresh_timer(void *userdata) {
-
-  VideoState *is = (VideoState *)userdata;
-  VideoPicture *vp;
-  double actual_delay, delay, sync_threshold, ref_clock, diff;
-  
-  if(is->video_st) {
-    if(is->pictq_size == 0) {
-      schedule_refresh(is, 1);
-    } else {
-      vp = &is->pictq[is->pictq_rindex];
-
-      delay = vp->pts - is->frame_last_pts; /* the pts from last time */
-      if(delay <= 0 || delay >= 1.0) {
-	/* if incorrect delay, use previous one */
-	delay = is->frame_last_delay;
-      }
-      /* save for next time */
-      is->frame_last_delay = delay;
-      is->frame_last_pts = vp->pts;
-
-      /* update delay to sync to audio */
-      ref_clock = get_audio_clock(is);
-      diff = vp->pts - ref_clock;
-
-      /* Skip or repeat the frame. Take delay into account
-	 FFPlay still doesn't "know if this is the best guess." */
-      sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
-      if(fabs(diff) < AV_NOSYNC_THRESHOLD) {
-	if(diff <= -sync_threshold) {
-	  delay = 0;
-	} else if(diff >= sync_threshold) {
-	  delay = 2 * delay;
-	}
-      }
-      is->frame_timer += delay;
-      /* computer the REAL delay */
-      actual_delay = is->frame_timer - (av_gettime() / 1000000.0);
-      if(actual_delay < 0.010) {
-	/* Really it should skip the picture instead */
-	actual_delay = 0.010;
-      }
-      schedule_refresh(is, (int)(actual_delay * 1000 + 0.5));
-      /* show the picture! */
-      video_display(is);
+    void video_refresh_timer(void *userdata) {
+    
+      VideoState *is = (VideoState *)userdata;
+      VideoPicture *vp;
+      double actual_delay, delay, sync_threshold, ref_clock, diff;
       
-      /* update queue for next picture! */
-      if(++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
-	is->pictq_rindex = 0;
+      if(is->video_st) {
+        if(is->pictq_size == 0) {
+          schedule_refresh(is, 1);
+        } else {
+          vp = &is->pictq[is->pictq_rindex];
+    
+          delay = vp->pts - is->frame_last_pts; /* the pts from last time */
+          if(delay <= 0 || delay >= 1.0) {
+            /* if incorrect delay, use previous one */
+	    delay = is->frame_last_delay;
+          }
+          /* save for next time */
+          is->frame_last_delay = delay;
+          is->frame_last_pts = vp->pts;
+    
+          /* update delay to sync to audio */
+          ref_clock = get_audio_clock(is);
+          diff = vp->pts - ref_clock;
+    
+          /* Skip or repeat the frame. Take delay into account
+        	 FFPlay still doesn't "know if this is the best guess." */
+          sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
+          if(fabs(diff) < AV_NOSYNC_THRESHOLD) {
+            if(diff <= -sync_threshold) {
+        	delay = 0;
+    	    } else if(diff >= sync_threshold) {
+	  	delay = 2 * delay;
+	    }
+          }
+          is->frame_timer += delay;
+          /* computer the REAL delay */
+          actual_delay = is->frame_timer - (av_gettime() / 1000000.0);
+          if(actual_delay < 0.010) {
+	    /* Really it should skip the picture instead */
+	    actual_delay = 0.010;
+          }
+          schedule_refresh(is, (int)(actual_delay * 1000 + 0.5));
+          /* show the picture! */
+          video_display(is);
+          
+          /* update queue for next picture! */
+          if(++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
+	    is->pictq_rindex = 0;
+          }
+          SDL_LockMutex(is->pictq_mutex);
+          is->pictq_size--;
+          SDL_CondSignal(is->pictq_cond);
+          SDL_UnlockMutex(is->pictq_mutex);
+        }
+      } else {
+        schedule_refresh(is, 100);
       }
-      SDL_LockMutex(is->pictq_mutex);
-      is->pictq_size--;
-      SDL_CondSignal(is->pictq_cond);
-      SDL_UnlockMutex(is->pictq_mutex);
     }
-  } else {
-    schedule_refresh(is, 100);
-  }
-}
+
 There are a few checks we make: first, we make sure that the delay between the PTS and the previous PTS make sense. If it doesn't we just guess and use the last delay. Next, we make sure we have a synch threshold because things are never going to be perfectly in synch. ffplay uses 0.01 for its value. We also make sure that the synch threshold is never smaller than the gaps in between PTS values. Finally, we make the minimum refresh value 10 milliseconds*.* Really here we should skip the frame, but we're not going to bother.
 We added a bunch of variables to the big struct so don't forget to check the code. Also, don't forget to initialize the frame timer and the initial previous frame delay in stream_component_open:
 
     is->frame_timer = (double)av_gettime() / 1000000.0;
     is->frame_last_delay = 40e-3;
-Synching: The Audio Clock
+
+####Synching: The Audio Clock
 
 Now it's time for us to implement the audio clock. We can update the clock time in our audio_decode_frame function, which is where we decode the audio. Now, remember that we don't always process a new packet every time we call this function, so there are two places we have to update the clock at. The first place is where we get the new packet: we simply set the audio clock to the packet's PTS. Then if a packet has multiple frames, we keep time the audio play by counting the number of samples and multiplying them by the given samples-per-second rate. So once we have the packet:
 
     /* if update, update the audio clock w/pts */
     if(pkt->pts != AV_NOPTS_VALUE) {
-      is->audio_clock = av_q2d(is->audio_st->time_base)*pkt->pts;
+        is->audio_clock = av_q2d(is->audio_st->time_base)*pkt->pts;
     }
+
 And once we are processing the packet:
-      /* Keep audio_clock up-to-date */
-      pts = is->audio_clock;
-      *pts_ptr = pts;
-      n = 2 * is->audio_st->codec->channels;
-      is->audio_clock += (double)data_size /
-	(double)(n * is->audio_st->codec->sample_rate);
+
+    /* Keep audio_clock up-to-date */
+    pts = is->audio_clock;
+    *pts_ptr = pts;
+    n = 2 * is->audio_st->codec->channels;
+    is->audio_clock += (double)data_size / (double)(n * is->audio_st->codec->sample_rate);
+
 A few fine details: the template of the function has changed to include pts_ptr, so make sure you change that. pts_ptr is a pointer we use to inform audio_callback the pts of the audio packet. This will be used next time for synchronizing the audio with the video.
 Now we can finally implement our get_audio_clock function. It's not as simple as getting the is->audio_clock value, thought. Notice that we set the audio PTS every time we process it, but if you look at the audio_callback function, it takes time to move all the data from our audio packet into our output buffer. That means that the value in our audio clock could be too far ahead. So we have to check how much we have left to write. Here's the complete code:
 
-double get_audio_clock(VideoState *is) {
-  double pts;
-  int hw_buf_size, bytes_per_sec, n;
-  
-  pts = is->audio_clock; /* maintained in the audio thread */
-  hw_buf_size = is->audio_buf_size - is->audio_buf_index;
-  bytes_per_sec = 0;
-  n = is->audio_st->codec->channels * 2;
-  if(is->audio_st) {
-    bytes_per_sec = is->audio_st->codec->sample_rate * n;
-  }
-  if(bytes_per_sec) {
-    pts -= (double)hw_buf_size / bytes_per_sec;
-  }
-  return pts;
-}
+    double get_audio_clock(VideoState *is) {
+      double pts;
+      int hw_buf_size, bytes_per_sec, n;
+      
+      pts = is->audio_clock; /* maintained in the audio thread */
+      hw_buf_size = is->audio_buf_size - is->audio_buf_index;
+      bytes_per_sec = 0;
+      n = is->audio_st->codec->channels * 2;
+      if(is->audio_st) {
+        bytes_per_sec = is->audio_st->codec->sample_rate * n;
+      }
+      if(bytes_per_sec) {
+        pts -= (double)hw_buf_size / bytes_per_sec;
+      }
+      return pts;
+    }
+
 You should be able to tell why this function works by now ;)
 So that's it! Go ahead and compile it:
 
-gcc -o tutorial05 tutorial05.c -lavutil -lavformat -lavcodec -lswscale -lz -lm \
-`sdl-config --cflags --libs`
+    gcc -o tutorial05 tutorial05.c -lavutil -lavformat -lavcodec -lswscale -lz -lm `sdl-config --cflags --libs`
+
 and finally! you can watch a movie on your own movie player. Next time we'll look at audio synching, and then the tutorial after that we'll talk about seeking.
+
+###第六章：Synching Audio
+
+Code: tutorial06.c
+
+####Synching Audio
+
+So now we have a decent enough player to watch a movie, so let's see what kind of loose ends we have lying around. Last time, we glossed over synchronization a little bit, namely sychronizing audio to a video clock rather than the other way around. We're going to do this the same way as with the video: make an internal video clock to keep track of how far along the video thread is and sync the audio to that. Later we'll look at how to generalize things to sync both audio and video to an external clock, too.
+
+####Implementing the video clock
+
+Now we want to implement a video clock similar to the audio clock we had last time: an internal value that gives the current time offset of the video currently being played. At first, you would think that this would be as simple as updating the timer with the current PTS of the last frame to be shown. However, don't forget that the time between video frames can be pretty long when we get down to the millisecond level. The solution is to keep track of another value, the time at which we set the video clock to the PTS of the last frame. That way the current value of the video clock will be PTS_of_last_frame + (current_time - time_elapsed_since_PTS_value_was_set). This solution is very similar to what we did with get_audio_clock.
+
+So, in our big struct, we're going to put a double video_current_pts and a int64_t video_current_pts_time. The clock updating is going to take place in the video_refresh_timer function:
+
+    void video_refresh_timer(void *userdata) {
+    
+      /* ... */
+    
+      if(is->video_st) {
+        if(is->pictq_size == 0) {
+          schedule_refresh(is, 1);
+        } else {
+          vp = &is->pictq[is->pictq_rindex];
+    
+          is->video_current_pts = vp->pts;
+          is->video_current_pts_time = av_gettime();
+
+Don't forget to initialize it in stream_component_open:
+
+    is->video_current_pts_time = av_gettime();
+
+And now all we need is a way to get the information:
+
+    double get_video_clock(VideoState *is) {
+      double delta;
+    
+      delta = (av_gettime() - is->video_current_pts_time) / 1000000.0;
+      return is->video_current_pts + delta;
+    }
+
+####Abstracting the clock
+
+But why force ourselves to use the video clock? We'd have to go and alter our video sync code so that the audio and video aren't trying to sync to each other. Imagine the mess if we tried to make it a command line option like it is in ffplay. So let's abstract things: we're going to make a new wrapper function, get_master_clock that checks an av_sync_type variable and then call get_audio_clock, get_video_clock, or whatever other clock we want to use. We could even use the computer clock, which we'll call get_external_clock:
+
+    enum {
+      AV_SYNC_AUDIO_MASTER,
+      AV_SYNC_VIDEO_MASTER,
+      AV_SYNC_EXTERNAL_MASTER,
+    };
+    
+    #define DEFAULT_AV_SYNC_TYPE AV_SYNC_VIDEO_MASTER
+    
+    double get_master_clock(VideoState *is) {
+      if(is->av_sync_type == AV_SYNC_VIDEO_MASTER) {
+        return get_video_clock(is);
+      } else if(is->av_sync_type == AV_SYNC_AUDIO_MASTER) {
+        return get_audio_clock(is);
+      } else {
+        return get_external_clock(is);
+      }
+    }
+    main() {
+    ...
+      is->av_sync_type = DEFAULT_AV_SYNC_TYPE;
+    ...
+    }
+
+####Synchronizing the Audio
+
+Now the hard part: synching the audio to the video clock. Our strategy is going to be to measure where the audio is, compare it to the video clock, and then figure out how many samples we need to adjust by, that is, do we need to speed up by dropping samples or do we need to slow down by adding them?
+
+We're going to run a synchronize_audio function each time we process each set of audio samples we get to shrink or expand them properly. However, we don't want to sync every single time it's off because process audio a lot more often than video packets. So we're going to set a minimum number of consecutive calls to the synchronize_audio function that have to be out of sync before we bother doing anything. Of course, just like last time, "out of sync" means that the audio clock and the video clock differ by more than our sync threshold.
+Note: What the heck is going on here? This equation looks like magic! Well, it's basically a weighted mean using a geometric series as weights. I don't know if there's a name for this (I even checked Wikipedia!) but for more info, here's an explanation (or at weightedmean.txt) So we're going to use a fractional coefficient, say c, and So now let's say we've gotten N audio sample sets that have been out of sync. The amount we are out of sync can also vary a good deal, so we're going to take an average of how far each of those have been out of sync. So for example, the first call might have shown we were out of sync by 40ms, the next by 50ms, and so on. But we're not going to take a simple average because the most recent values are more important than the previous ones. So we're going to use a fractional coefficient, say c, and sum the differences like this: diff_sum = new_diff + diff_sum*c. When we are ready to find the average difference, we simply calculate avg_diff = diff_sum * (1-c).
+
+Here's what our function looks like so far:
+
+    /* Add or subtract samples to get a better sync, return new
+       audio buffer size */
+    int synchronize_audio(VideoState *is, short *samples,
+    		      int samples_size, double pts) {
+      int n;
+      double ref_clock;
+      
+      n = 2 * is->audio_st->codec->channels;
+      
+      if(is->av_sync_type != AV_SYNC_AUDIO_MASTER) {
+        double diff, avg_diff;
+        int wanted_size, min_size, max_size, nb_samples;
+        
+        ref_clock = get_master_clock(is);
+        diff = get_audio_clock(is) - ref_clock;
+    
+        if(diff < AV_NOSYNC_THRESHOLD) {
+          // accumulate the diffs
+          is->audio_diff_cum = diff + is->audio_diff_avg_coef
+            * is->audio_diff_cum;
+          if(is->audio_diff_avg_count < AUDIO_DIFF_AVG_NB) {
+	    is->audio_diff_avg_count++;
+          } else {
+	    avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
+    
+           /* Shrinking/expanding buffer code.... */
+    
+          }
+        } else {
+          /* difference is TOO big; reset diff stuff */
+          is->audio_diff_avg_count = 0;
+          is->audio_diff_cum = 0;
+        }
+      }
+      return samples_size;
+    }
+
+So we're doing pretty well; we know approximately how off the audio is from the video or whatever we're using for a clock. So let's now calculate how many samples we need to add or lop off by putting this code where the "Shrinking/expanding buffer code" section is:
+
+    if(fabs(avg_diff) >= is->audio_diff_threshold) {
+      wanted_size = samples_size + 
+      ((int)(diff * is->audio_st->codec->sample_rate) * n);
+      min_size = samples_size * ((100 - SAMPLE_CORRECTION_PERCENT_MAX) / 100);
+      max_size = samples_size * ((100 + SAMPLE_CORRECTION_PERCENT_MAX) / 100);
+      if(wanted_size < min_size) {
+        wanted_size = min_size;
+      } else if (wanted_size > max_size) {
+        wanted_size = max_size;
+      }
+
+Remember that audio_length * (sample_rate * # of channels * 2) is the number of samples in audio_length seconds of audio. Therefore, number of samples we want is going to be the number of samples we already have plus or minus the number of samples that correspond to the amount of time the audio has drifted. We'll also set a limit on how big or small our correction can be because if we change our buffer too much, it'll be too jarring to the user.
+
+####Correcting the number of samples
+
+Now we have to actually correct the audio. You may have noticed that our synchronize_audio function returns a sample size, which will then tell us how many bytes to send to the stream. So we just have to adjust the sample size to the wanted_size. This works for making the sample size smaller. But if we want to make it bigger, we can't just make the sample size larger because there's no more data in the buffer! So we have to add it. But what should we add? It would be foolish to try and extrapolate audio, so let's just use the audio we already have by padding out the buffer with the value of the last sample.
+
+    if(wanted_size < samples_size) {
+      /* remove samples */
+      samples_size = wanted_size;
+    } else if(wanted_size > samples_size) {
+      uint8_t *samples_end, *q;
+      int nb;
+    
+      /* add samples by copying final samples */
+      nb = (samples_size - wanted_size);
+      samples_end = (uint8_t *)samples + samples_size - n;
+      q = samples_end + n;
+      while(nb > 0) {
+        memcpy(q, samples_end, n);
+        q += n;
+        nb -= n;
+      }
+      samples_size = wanted_size;
+    }
+
+Now we return the sample size, and we're done with that function. All we need to do now is use it:
+
+    void audio_callback(void *userdata, Uint8 *stream, int len) {
+    
+      VideoState *is = (VideoState *)userdata;
+      int len1, audio_size;
+      double pts;
+    
+      while(len > 0) {
+        if(is->audio_buf_index >= is->audio_buf_size) {
+          /* We have already sent all our data; get more */
+          audio_size = audio_decode_frame(is, is->audio_buf, sizeof(is->audio_buf), &pts);
+          if(audio_size < 0) {
+	    /* If error, output silence */
+	    is->audio_buf_size = 1024;
+	    memset(is->audio_buf, 0, is->audio_buf_size);
+          } else {
+	    audio_size = synchronize_audio(is, (int16_t *)is->audio_buf, audio_size, pts);
+	    is->audio_buf_size = audio_size;
+
+All we did is inserted the call to synchronize_audio. (Also, make sure to check the source code where we initalize the above variables I didn't bother to define.)
+One last thing before we finish: we need to add an if clause to make sure we don't sync the video if it is the master clock:
+
+    if(is->av_sync_type != AV_SYNC_VIDEO_MASTER) {
+      ref_clock = get_master_clock(is);
+      diff = vp->pts - ref_clock;
+    
+      /* Skip or repeat the frame. Take delay into account
+         FFPlay still doesn't "know if this is the best guess." */
+      sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
+      if(fabs(diff) < AV_NOSYNC_THRESHOLD) {
+        if(diff <= -sync_threshold) {
+          delay = 0;
+        } else if(diff >= sync_threshold) {
+          delay = 2 * delay;
+        }
+      }
+    }
+
+And that does it! Make sure you check through the source file to initialize any variables that I didn't bother defining or initializing. Then compile it:
+
+    gcc -o tutorial06 tutorial06.c -lavutil -lavformat -lavcodec -lswscale -lz -lm `sdl-config --cflags --libs`
+
+and you'll be good to go.
+Next time we'll make it so you can rewind and fast forward your movie.
+
+###第七章：Seeking
+
+Code: tutorial07.c
+
+####Handling the seek command
+
+Now we're going to add some seeking capabilities to our player, because it's really annoying when you can't rewind a movie. Plus, this will show you how easy the av_seek_frame function is to use.
+
+We're going to make the left and right arrows go back and forth in the movie by a little and the up and down arrows a lot, where "a little" is 10 seconds, and "a lot" is 60 seconds. So we need to set up our main loop so it catches the keystrokes. However, when we do get a keystroke, we can't call av_seek_frame directly. We have to do that in our main decode loop, the decode_thread loop. So instead, we're going to add some values to the big struct that will contain the new position to seek to and some seeking flags:
+
+      int             seek_req;
+      int             seek_flags;
+      int64_t         seek_pos;
+
+Now we need to set up our main loop to catch the key presses:
+
+      for(;;) {
+        double incr, pos;
+    
+        SDL_WaitEvent(&event);
+        switch(event.type) {
+        case SDL_KEYDOWN:
+          switch(event.key.keysym.sym) {
+          case SDLK_LEFT:
+	    incr = -10.0;
+	    goto do_seek;
+          case SDLK_RIGHT:
+	    incr = 10.0;
+	    goto do_seek;
+          case SDLK_UP:
+	    incr = 60.0;
+	    goto do_seek;
+          case SDLK_DOWN:
+	    incr = -60.0;
+	    goto do_seek;
+          do_seek:
+	    if(global_video_state) {
+	      pos = get_master_clock(global_video_state);
+	      pos += incr;
+	      stream_seek(global_video_state, (int64_t)(pos * AV_TIME_BASE), incr);
+	    }
+	    break;
+          default:
+	    break;
+          }
+          break;
+
+To detect keypresses, we first look and see if we get an SDL_KEYDOWN event. Then we check and see which key got hit using event.key.keysym.sym. Once we know which way we want to seek, we calculate the new time by adding the increment to the value from our new get_master_clock function. Then we call a stream_seek function to set the seek_pos, etc., values. We convert our new time to avcodec's internal timestamp unit. Recall that timestamps in streams are measured in frames rather than seconds, with the formula seconds = frames * time_base (fps). avcodec defaults to a value of 1,000,000 fps (so a pos of 2 seconds will be timestamp of 2000000). We'll see why we need to convert this value later.
+Here's our stream_seek function. Notice we set a flag if we are going backwards:
+
+    void stream_seek(VideoState *is, int64_t pos, int rel) {
+    
+      if(!is->seek_req) {
+        is->seek_pos = pos;
+        is->seek_flags = rel < 0 ? AVSEEK_FLAG_BACKWARD : 0;
+        is->seek_req = 1;
+      }
+    }
+
+Now let's go over to our decode_thread where we will actually perform our seek. You'll notice in the source files that we've marked an area "seek stuff goes here". Well, we're going to put it there now.
+Seeking centers around the av_seek_frame function. This function takes a format context, a stream, a timestamp, and a set of flags as an argument. The function will seek to the timestamp you give it. The unit of the timestamp is the time_base of the stream you pass the function. However, you do not have to pass it a stream (indicated by passing a value of -1). If you do that, the time_base will be in avcodec's internal timestamp unit, or 1000000fps. This is why we multiplied our position by AV_TIME_BASE when we set seek_pos.
+
+However, sometimes you can (rarely) run into problems with some files if you pass av_seek_frame -1 for a stream, so we're going to pick the first stream in our file and pass it to av_seek_frame. Don't forget we have to rescale our timestamp to be in the new unit too.
+
+    if(is->seek_req) {
+      int stream_index= -1;
+      int64_t seek_target = is->seek_pos;
+    
+      if     (is->videoStream >= 0) stream_index = is->videoStream;
+      else if(is->audioStream >= 0) stream_index = is->audioStream;
+    
+      if(stream_index>=0){
+        seek_target= av_rescale_q(seek_target, AV_TIME_BASE_Q, pFormatCtx->streams[stream_index]->time_base);
+      }
+      if(av_seek_frame(is->pFormatCtx, stream_index, seek_target, is->seek_flags) < 0) {
+        fprintf(stderr, "%s: error while seeking\n", is->pFormatCtx->filename);
+      } else {
+         /* handle packet queues... more later... */
+
+av_rescale_q(a,b,c) is a function that will rescale a timestamp from one base to another. It basically computes a*b/c but this function is required because that calculation could overflow. AV_TIME_BASE_Q is the fractional version of AV_TIME_BASE. They're quite different: AV_TIME_BASE * time_in_seconds = avcodec_timestamp and AV_TIME_BASE_Q * avcodec_timestamp = time_in_seconds (but note that AV_TIME_BASE_Q is actually an AVRational object, so you have to use special q functions in avcodec to handle it).
+Flushing our buffers
+
+So we've set our seek correctly, but we aren't finished quite yet. Remember that we have a queue set up to accumulate packets. Now that we're in a different place, we have to flush that queue or the movie ain't gonna seek! Not only that, but avcodec has its own internal buffers that need to be flushed too by each thread.
+
+To do this, we need to first write a function to clear our packet queue. Then, we need to have some way of instructing the audio and video thread that they need to flush avcodec's internal buffers. We can do this by putting a special packet on the queue after we flush it, and when they detect that special packet, they'll just flush their buffers.
+
+Let's start with the flush function. It's really quite simple, so I'll just show you the code:
+
+    static void packet_queue_flush(PacketQueue *q) {
+      AVPacketList *pkt, *pkt1;
+    
+      SDL_LockMutex(q->mutex);
+      for(pkt = q->first_pkt; pkt != NULL; pkt = pkt1) {
+        pkt1 = pkt->next;
+        av_free_packet(&pkt->pkt);
+        av_freep(&pkt);
+      }
+      q->last_pkt = NULL;
+      q->first_pkt = NULL;
+      q->nb_packets = 0;
+      q->size = 0;
+      SDL_UnlockMutex(q->mutex);
+    }
+
+Now that the queue is flushed, let's put on our "flush packet." But first we're going to want to define what that is and create it:
+
+AVPacket flush_pkt;
+
+    main() {
+      ...
+      av_init_packet(&flush_pkt);
+      flush_pkt.data = "FLUSH";
+      ...
+    }
+
+Now we put this packet on the queue:
+
+      } else {
+        if(is->audioStream >= 0) {
+          packet_queue_flush(&is->audioq);
+          packet_queue_put(&is->audioq, &flush_pkt);
+        }
+        if(is->videoStream >= 0) {
+          packet_queue_flush(&is->videoq);
+          packet_queue_put(&is->videoq, &flush_pkt);
+        }
+      }
+      is->seek_req = 0;
+    }
+
+(This code snippet also continues the code snippet above for decode_thread.) We also need to change packet_queue_put so that we don't duplicate the special flush packet:
+
+    int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
+    
+      AVPacketList *pkt1;
+      if(pkt != &flush_pkt && av_dup_packet(pkt) < 0) {
+        return -1;
+      }
+
+And then in the audio thread and the video thread, we put this call to avcodec_flush_buffers immediately after packet_queue_get:
+
+        if(packet_queue_get(&is->audioq, pkt, 1) < 0) {
+          return -1;
+        }
+        if(pkt->data == flush_pkt.data) {
+          avcodec_flush_buffers(is->audio_st->codec);
+          continue;
+        }
+
+The above code snippet is exactly the same for the video thread, with "audio" being replaced by "video".
+That's it! We're done! Go ahead and compile your player:
+
+    gcc -o tutorial07 tutorial07.c -lavutil -lavformat -lavcodec -lswscale -lz -lm `sdl-config --cflags --libs`
+
+and enjoy your movie player made in less than 1000 lines of C!
+Of course, there's a lot of things we glanced over that we could add.
+
+
+### END：What now?
+
+So we have a working player, but it's certainly not as nice as it could be. We did a lot of handwaving, and there are a lot of other features we could add:
+
+Let's face it, this player sucks. The version of ffplay.c it is based on is totally outdated, and this tutorial needs a major rehaul as a result. If you want to move on to more serious projects using ffmpeg libraries, I implore you to check out the most recent version of ffplay.c as your next task.
+Error handling. The error handling in our code is abysmal, and could be handled a lot better.
+Pausing. We can't pause the movie, which is admittedly a useful feature. We can do this by making use of an internal paused variable in our big struct that we set when the user pauses. Then our audio, video, and decode threads check for it so they don't output anything. We also use av_read_play for network support. It's pretty simple to explain, but it's not obvious to figure out for yourself, so consider this homework if you want to try more. For hints, check out ffplay.c.
+Support for video hardware.
+Seeking by bytes. If you calculate the seek position by bytes instead of seconds, it is more accurate on video files that have discontiguous timestamps, like VOB files.
+Frame dropping. If the video falls too far behind, we should drop the next frame instead of setting a short refresh.
+Network support. This video player can't play network streaming video.
+Support for raw video like YUV files. There are some options we have to set if our player is to support raw video like YUV files, as we cannot guess the size or time_base.
+Fullscreen
+Various options, e.g. different pic formats; see ffplay.c for all the command line switches.
+If you want to know more about ffmpeg, we've only covered a portion of it. The next step would be to study how to encode multimedia. A good place to start would be the output_example.c file in the ffmpeg distribution. I may write another tutorial on that, but I might not get around to it.
+UPDATE It has been a long time since I updated this, and the world of video software has gotten a lot more mature. This tutorial has only required simple API updates; very little has actually changed in terms of the basic concepts. Most of those updates have actually simplified the code. However, while I have gone through and updated the code here, ffplay still totally outperforms this toy player. Let's be frank, it's pretty unusable as an actual movie player. So if you or your future self wants to improve this tutorial, go into ffplay and find out what we're missing. My guess is it's mostly taking advantage of video hardware, but maybe I'm missing some obvious things. It's possible ffplay might have drastically changed some things; I haven't looked yet.
+
+But I'm very proud that it has still helped a lot of people out over the years, even if you had to go get code elsewhere. My absolute gratitude to chelyaev who did the work in replacing all the functions that were deprecated since I wrote this 8 (!) years ago.
+
+Well, I hope this tutorial was instructive and fun. If you have any suggestions, bugs, complaints, accolades, etc., about this tutorial, please email me at dranger at gmail dot com. Please do not ask me for help in your other ffmpeg projects. I get way too many of those emails.
