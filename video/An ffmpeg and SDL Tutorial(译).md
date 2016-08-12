@@ -707,9 +707,9 @@ Hooray! 现在视频播放仍然很快，但是音频的播放很正常。
 
 ####综述
 
-Last time we added audio support by taking advantage of SDL's audio functions. SDL started a thread that made callbacks to a function we defined every time it needed audio. Now we're going to do the same sort of thing with the video display. This makes the code more modular and easier to work with - especially when we want to add syncing. So where do we start?
+上一章我们利用SDL的音频功能添加了音频支持。SDL启动一个线程，每次需要音频时回调我们定义的函数。现在，我们对视频做的同样的事情。这使代码更加模块化，也更容易使用（当我们做同步的时候就会知道了），好，现在开始。
 
-First we notice that our main function is handling an awful lot: it's running through the event loop, reading in packets, and decoding the video. So what we're going to do is split all those apart: we're going to have a thread that will be responsible for decoding the packets; these packets will then be added to the queue and read by the corresponding audio and video threads. The audio thread we have already set up the way we want it; the video thread will be a little more complicated since we have to display the video ourselves. We will add the actual display code to the main loop. But instead of just displaying video every time we loop, we will integrate the video display into the event loop. The idea is to decode the video, save the resulting frame in another queue, then create a custom event (FF_REFRESH_EVENT) that we add to the event system, then when our event loop sees this event, it will display the next frame in the queue. Here's a handy ASCII art illustration of what is going on:
+首先看看我们的main函数都做了什么：通过事件循环运行，读取packets，视频解码。那么我们可以对它进行一些拆分：一个负责解码packets的线程，这些packets被添加到队列，并被相应的音视频线程读取，音频线程我们已经处理好了，因为要显示视频，所以视频线程处理相对负责一些。我们要在主循环中添加显示代码，而不仅仅是在每次循环中显示视频，我们要把视频显示整合到事件循环中。一个思路是解码视频，并把它的帧存到另一个队列中，然后生成一个自定义事件(FF_REFRESH_EVENT)，把它添加到事件系统中，然后当我们在事件循环遇到这个事件的时候，我们就把队列中的下一帧视频显示出来。流程图如下:
 
      ________ audio  _______      _____
     |        | pkts |       |    |     | to spkr
@@ -725,10 +725,11 @@ First we notice that our main function is handling an awful lot: it's running th
     |_______|<---FF_REFRESH----|_______|
 
 
-The main purpose of moving controlling the video display via the event loop is that using an SDL_Delay thread, we can control exactly when the next video frame shows up on the screen. When we finally sync the video in the next tutorial, it will be a simple matter to add the code that will schedule the next video refresh so the right picture is being shown on the screen at the right time.
-Simplifying Code
+用事件循环控制视频显示的目的是使用 SDL_Delay 线程。这样我们就可以精确的控制下一帧显示在屏幕上的事件。那么我们就可以让视频在正确的时间上显示正确的画面。
 
-We're also going to clean up the code a bit. We have all this audio and video codec information, and we're going to be adding queues and buffers and who knows what else. All this stuff is for one logical unit, viz. the movie. So we're going to make a large struct that will hold all that information called the VideoState.
+####简化代码
+
+我们有音频和视频编解码器的信息，以及相应的添加队列和缓冲区，以及其它的东西，其实这就是对视频的描述，所以我们创建一个大的结构体（VideoState）
 
     typedef struct VideoState {
     
@@ -759,8 +760,9 @@ We're also going to clean up the code a bit. We have all this audio and video co
       int             quit;
     } VideoState;
 
-Here we see a glimpse of what we're going to get to. First we see the basic information - the format context and the indices of the audio and video stream, and the corresponding AVStream objects. Then we can see that we've moved some of those audio buffers into this structure. These (audio_buf, audio_buf_size, etc.) were all for information about audio that was still lying around (or the lack thereof). We've added another queue for the video, and a buffer (which will be used as a queue; we don't need any fancy queueing stuff for this) for the decoded frames (saved as an overlay). The VideoPicture struct is of our own creations (we'll see what's in it when we come to it). We also notice that we've allocated pointers for the two extra threads we will create, and the quit flag and the filename of the movie.
-So now we take it all the way back to the main function to see how this changes our program. Let's set up our VideoState struct:
+它包括：格式上下文(format context)、音视频流的索引，以及相应的AVStream对象，音频的缓冲区，用于存储解码后视频帧的队列和缓冲区，VideoPicture自定义的结构体，两个额外的线程指针，退出flag和文件名。
+
+现在回到主函数，看看怎么用VideoState结构体:
 
     int main(int argc, char *argv[]) {
     
@@ -770,18 +772,20 @@ So now we take it all the way back to the main function to see how this changes 
     
       is = av_mallocz(sizeof(VideoState));
 
-av_mallocz() is a nice function that will allocate memory for us and zero it out.
-Then we'll initialize our locks for the display buffer (pictq), because since the event loop calls our display function - the display function, remember, will be pulling pre-decoded frames from pictq. At the same time, our video decoder will be putting information into it - we don't know who will get there first. Hopefully you recognize that this is a classic race condition. So we allocate it now before we start any threads. Let's also copy the filename of our movie into our VideoState.
+av_mallocz() 为我们分配内存并把它置零。
+
+然后初始化显示缓冲区(pictq)的锁，直到事件循环调用我们的显示函数，才从pictq中拉取预解码的帧。同时，我们的视频解码器会给它放入信息，我们并不知道它们处理的先后顺序。这是一个典型的竞争条件。所以我们要在启动任何线程之前，分配它。我们也把文件名复制到 VideoState 结构体中。
 
     av_strlcpy(is->filename, argv[1], sizeof(is->filename));
     
     is->pictq_mutex = SDL_CreateMutex();
     is->pictq_cond = SDL_CreateCond();
 
-av_strlcpy is a function from ffmpeg that does some extra bounds checking beyond strncpy.
-Our First Thread
+av_strlcpy 是ffmpeg的一个函数，它比 strncpy 多了一些边界判断。
 
-Now let's finally launch our threads and get the real work done:
+####第一个线程
+
+现在开始我们的线程，看看它怎么工作:
 
     schedule_refresh(is, 40);
     
@@ -791,10 +795,11 @@ Now let's finally launch our threads and get the real work done:
       return -1;
     }
 
-schedule_refresh is a function we will define later. What it basically does is tell the system to push a FF_REFRESH_EVENT after the specified number of milliseconds. This will in turn call the video refresh function when we see it in the event queue. But for now, let's look at SDL_CreateThread().
-SDL_CreateThread() does just that - it spawns a new thread that has complete access to all the memory of the original process, and starts the thread running on the function we give it. It will also pass that function user-defined data. In this case, we're calling decode_thread() and with our VideoState struct attached. The first half of the function has nothing new; it simply does the work of opening the file and finding the index of the audio and video streams. The only thing we do different is save the format context in our big struct. After we've found our stream indices, we call another function that we will define, stream_component_open(). This is a pretty natural way to split things up, and since we do a lot of similar things to set up the video and audio codec, we reuse some code by making this a function.
+schedule_refresh是后面定义的一个函数。它的基本工作是在指定毫秒后给系统发送一个FF_REFRESH_EVENT事件。然后事件循环在遇到它的时候，进行视频显示刷新。但现在，我们先来看 SDL_CreateThread() 函数。
 
-The stream_component_open() function is where we will find our codec decoder, set up our audio options, save important information to our big struct, and launch our audio and video threads. This is where we would also insert other options, such as forcing the codec instead of autodetecting it and so forth. Here it is:
+SDL_CreateThread() 创建一个能访问原处理中所有内存的线程，并在我们给定的函数中运行线程。这里我们调用decode_thread()，并与VideoState结构关联。该函数的上半部分就是打开文件，找到音视频流的索引，把格式上下文(format context)放到VideoState中。得到流索引之后，调用我们定义的另一个方法（stream_component_open()），因为音视频编解码器设置很像，所以这样我们可以重用一些代码。
+
+在 stream_component_open() 函数中找到编解码器，设置音频选项，将重要的信息保存到VideoState中，并运行音视频线程。这里，我们也会放入一些其它选项，比如不自动获取codec，而是强制指定codec。下面是代码:
 
     int stream_component_open(VideoState *is, int stream_index) {
     
@@ -966,6 +971,7 @@ Let's look at the function that stores our decoded frame, pFrame in our picture 
     } VideoPicture;
 
 Our big struct has a buffer of these in it where we can store them. However, we need to allocate the SDL_Overlay ourselves (notice the allocated flag that will indicate whether we have done so or not).
+
 To use this queue, we have two pointers - the writing index and the reading index. We also keep track of how many actual pictures are in the buffer. To write to the queue, we're going to first wait for our buffer to clear out so we have space to store our VideoPicture. Then we check and see if we have already allocated the overlay at our writing index. If not, we'll have to allocate some space. We also have to reallocate the buffer if the size of the window has changed!
 
     int queue_picture(VideoState *is, AVFrame *pFrame) {
@@ -1000,7 +1006,7 @@ To use this queue, we have two pointers - the writing index and the reading inde
         }
       }
 
-Let's look at the alloc_picture() function:
+下面看看 alloc_picture() 函数:
 
     void alloc_picture(void *userdata) {
     
@@ -1024,8 +1030,9 @@ Let's look at the alloc_picture() function:
       vp->allocated = 1;
     }
 
-You should recognize the SDL_CreateYUVOverlay function that we've moved from our main loop to this section. This code should be fairly self-explanitory by now. However, now we have a mutex lock around it because two threads cannot write information to the screen at the same time! This will prevent our alloc_picture function from stepping on the toes of the function that will display the picture. (We've created this lock as a global variable and initialized it in main(); see code.) Remember that we save the width and height in the VideoPicture structure because we need to make sure that our video size doesn't change for some reason.
-Okay, we're all settled and we have our YUV overlay allocated and ready to receive a picture. Let's go back to queue_picture and look at the code to copy the frame into the overlay. You should recognize that part of it:
+你可能看到了 SDL_CreateYUVOverlay 函数，我们把它从主循环中拿了出来。现在这段代码的含义很明显。因为两个线程不能同时往屏幕上输出信息，所以我们用互斥锁给它加锁。我们在VideoPicture结构体中保存了宽度和高度，是为了确保视频大小不被改变。
+
+现在我们分配好了YUV覆盖（overlay），准备接受图片了。我们回到 queue_picture，看看怎么用代码把帧复制到覆盖（overlay）中:
 
     int queue_picture(VideoState *is, AVFrame *pFrame) {
     
@@ -1065,18 +1072,18 @@ Okay, we're all settled and we have our YUV overlay allocated and ready to recei
       return 0;
     }
 
-The majority of this part is simply the code we used earlier to fill the YUV overlay with our frame. The last bit is simply "adding" our value onto the queue. The queue works by adding onto it until it is full, and reading from it as long as there is something on it. Therefore everything depends upon the is->pictq_size value, requiring us to lock it. So what we do here is increment the write pointer (and rollover if necessary), then lock the queue and increase its size. Now our reader will know there is more information on the queue, and if this makes our queue full, our writer will know about it.
-Displaying the Video
+####显示视频
 
-That's it for our video thread! Now we've wrapped up all the loose threads except for one — remember that we called the schedule_refresh() function way back? Let's see what that actually did:
+这就是我们的视频线程。除了 schedule_refresh() 函数，我们已经处理完了，下面我们看看 schedule_refresh():
 
     /* schedule a video refresh in 'delay' ms */
     static void schedule_refresh(VideoState *is, int delay) {
       SDL_AddTimer(delay, sdl_refresh_timer_cb, is);
     }
 
-SDL_AddTimer() is an SDL function that simply makes a callback to the user-specfied function after a certain number of milliseconds (and optionally carrying some user data). We're going to use this function to schedule video updates - every time we call this function, it will set the timer, which will trigger an event, which will have our main() function in turn call a function that pulls a frame from our picture queue and displays it! Phew!
-But first thing's first. Let's trigger that event. That sends us over to:
+SDL_AddTimer() 是一个SDL函数，它能够在指定的毫秒数之后回调我们指定的函数。可以使用这个函数去控制视频更新，每次调用这个函数的时候，它会设置将要触发某一事件的定时器，触发事件后main()函数将调用从图像队列中拉取一帧，并显示的函数。
+
+首先我们看看怎么发送事件:
 
     static Uint32 sdl_refresh_timer_cb(Uint32 interval, void *opaque) {
       SDL_Event event;
@@ -1086,8 +1093,9 @@ But first thing's first. Let's trigger that event. That sends us over to:
       return 0; /* 0 means stop timer */
     }
 
-Here is the now-familiar event push. FF_REFRESH_EVENT is defined here as SDL_USEREVENT + 1. One thing to notice is that when we return 0, SDL stops the timer so the callback is not made again.
-Now we've pushed an FF_REFRESH_EVENT, we need to handle it in our event loop:
+这是事件触发。FF_REFRESH_EVENT 事件是用 SDL_USEREVENT + 1 定义的。有一点要注意的是，当我们 return 0 的时候，SDL会停掉定时器，那么就不会在处理callback
+
+现在我们发出一个 FF_REFRESH_EVENT 事件，我们需要处理它:
 
     for(;;) {
     
@@ -1098,7 +1106,7 @@ Now we've pushed an FF_REFRESH_EVENT, we need to handle it in our event loop:
         video_refresh_timer(event.user.data1);
         break;
 
-and that sends us to this function, which will actually pull the data from our picture queue:
+它调用我们写的 video_refresh_timer 函数，video_refresh_timer 会从图像队列中拉取相应的数据:
 
     void video_refresh_timer(void *userdata) {
     
@@ -1131,8 +1139,9 @@ and that sends us to this function, which will actually pull the data from our p
       }
     }
 
-For now, this is a pretty simple function: it pulls from the queue when we have something, sets our timer for when the next video frame should be shown, calls video_display to actually show the video on the screen, then increments the counter on the queue, and decreases its size. You may notice that we don't actually do anything with vp in this function, and here's why: we will. Later. We're going to use it to access timing information when we start syncing the video to the audio. See where it says "timing code here"? In that section, we're going to figure out how soon we should show the next video frame, and then input that value into the schedule_refresh() function. For now we're just putting in a dummy value of 80. Technically, you could guess and check this value, and recompile it for every movie you watch, but 1) it would drift after a while and 2) it's quite silly. We'll come back to it later, though.
-We're almost done; we just have one last thing to do: display the video! Here's that video_display function:
+目前为止，这是一个非常简单的函数：当我们要做什么的时候就从队列中拉取数据，当下一帧视频可以显示的时候设置我们的定时器，然后调用 video_display 函数显示视频，然后累加队列计数器，并减小队列的大小。你可能注意到这个函数里我们并没有对 vp 做任何事情，稍后我们会进行用到它，当我们开始做音视频同步的时候，我们将会使用它来获取时间轴数据。现在我们看“timing code here”这个位置，这个部分，我们要计算多久显示下一帧视频，并把这个时间告诉 schedule_refresh() 函数。现在我们先写死这个值是80，针对每一个视频我们可以去一点点尝试确认这个值，但这是非常愚蠢的，之后我们会讲解如何自动得到这个值。
+
+基本完工了，我们就剩下最后一件事情：显示视频。现在我们来看 video_display 函数:
 
     void video_display(VideoState *is) {
     
@@ -1173,8 +1182,8 @@ We're almost done; we just have one last thing to do: display the video! Here's 
       }
     }
 
-Since our screen can be of any size (we set ours to 640x480 and there are ways to set it so it is resizable by the user), we need to dynamically figure out how big we want our movie rectangle to be. So first we need to figure out our movie's aspect ratio, which is just the width divided by the height. Some codecs will have an odd sample aspect ratio, which is simply the width/height radio of a single pixel, or sample. Since the height and width values in our codec context are measured in pixels, the actual aspect ratio is equal to the aspect ratio times the sample aspect ratio. Some codecs will show an aspect ratio of 0, and this indicates that each pixel is simply of size 1x1. Then we scale the movie to fit as big in our screen as we can. The & -3 bit-twiddling in there simply rounds the value to the nearest multiple of 4. Then we center the movie, and call SDL_DisplayYUVOverlay(), making sure we use the screen mutex to access it.
-So is that it? Are we done? Well, we still have to rewrite the audio code to use the new VideoStruct, but those are trivial changes, and you can look at those in the sample code. The last thing we have to do is to change our callback for ffmpeg's internal "quit" callback function:
+因为我们的屏幕可以是任意大小的，所以我们需要动态计算出我们想要多大的视频矩形大小。所以，首先我们需要计算出视频的高宽比（width/height）。一些编解码器会有奇数采样的宽高比(odd sample aspect ratio)，这只是一个简单的单像素或者采样的宽高比。因为在codec context中用像素来测量高度和宽度的值，实际上宽高比就等于采样的宽高比的倍数。还有一些 codec 的宽高比是0，这表示每一个像素都是1*1。然后我们按比例在我们的屏幕中缩放。把视频放在中心，调用SDL_DisplayYUVOverlay()，确保屏幕互斥的访问它。
+好了，现在我们还要用VideoStruct重写音频编码，但基本没有变化，可以看看那些简单的示例代码。现在我们要做最后一件事，修改我们的回调函数，去调用FFmpeg内部的回调（“退出”的回调函数）:
 
     VideoState *global_video_state;
     
@@ -1182,9 +1191,10 @@ So is that it? Are we done? Well, we still have to rewrite the audio code to use
       return (global_video_state && global_video_state->quit);
     }
 
-We set global_video_state to the big struct in main().
-So that's it! Go ahead and compile it:
+在main函数中设置 global_video_state to the big struct in main()。
+
+好了，现在我们来编译吧:
 
     gcc -o tutorial04 tutorial04.c -lavutil -lavformat -lavcodec -lswscale -lz -lm `sdl-config --cflags --libs`
 
-and enjoy your unsynced movie! Next time we'll finally build a video player that actually works!
+享受音视频不同步的视频吧，^0^! 下一章我们将做一个可以正常工作的播放器!
