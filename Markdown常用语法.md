@@ -196,3 +196,7 @@
 
 ---
 
+### 更多语法可以参考下面的文档
+
+[Markdown: Syntax](https://github.com/othree/markdown-syntax-zhtw/blob/master/syntax.md)：https://github.com/othree/markdown-syntax-zhtw/blob/master/syntax.md
+
