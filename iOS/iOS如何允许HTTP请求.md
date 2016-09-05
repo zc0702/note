@@ -27,5 +27,5 @@ iOS9对应用网络安全做了升级，默认不支持 HTTP 请求，而要求�
                 <key>NSIncludesSubdomains</key>
                 <true/>
             </dict>
-           </dict>
-   </dict>
+        </dict>
+    </dict>
